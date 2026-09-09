@@ -1,108 +1,112 @@
-ASX MAXIMUM EDGE™ V8-I — DATA GATEWAY V2
-A source-agnostic market-data validation layer for the MAXIMUM EDGE™ V8-I
-intraday engine.
-V2 objectives
-Source abstraction
-Per-field timestamps
-Source timestamp vs gateway receipt timestamp
-Measured data age
-Automatic GREEN / AMBER / ORANGE / RED / UNKNOWN
-Source-quality scoring
-Multi-source cross-validation
-Automatic rejection of stale/inconsistent observations
-Separate quote and market-depth clocks
-Execution authorization kept completely separate from data integrity
-Current sources
-Primary: ASX Equity Stocks / Migizi Tech
-Configured with:
-`ASX_API_URL`
-`ASX_API_KEY`
-The provider currently documents approximately 30-second refresh for core quote
-fields, but that declared refresh interval is NOT treated as proof of current
-data age. If the upstream response does not contain a trustworthy timestamp,
-V2 reports freshness as `UNKNOWN`.
-Independent corroboration: Yahoo Finance chart
-Enabled by default with:
-`ENABLE_YAHOO_SOURCE=true`
-Yahoo Finance describes ASX market data as delayed. V2 therefore uses Yahoo
-primarily for independent cross-validation and timestamp auditing. It does not
-promote Yahoo to exchange-real-time execution data.
-Integrity classes
-`GREEN`: source timestamp verified and age <= 60 seconds
-`AMBER`: source timestamp verified and age <= 180 seconds
-`ORANGE`: source timestamp verified and age <= 900 seconds
-`RED`: stale beyond threshold, invalid, inconsistent, or impossible timestamp
-`UNKNOWN`: required source age cannot be verified
-A declared provider refresh interval does not substitute for a source
-timestamp.
-Cross-validation
-V2 compares independent observations only when:
-both sources provide timestamps;
-timestamps are within 120 seconds;
-both prices are available.
-Default maximum price discrepancy is 0.50%.
-If observations cannot be compared because timestamps are absent or too far
-apart, status is `NOT_COMPARABLE`, not PASS.
-Execution authorization
-Execution authorization is intentionally separate.
-`V8I_EXECUTION_AUTHORIZED` defaults to `false`.
-Even if a source receives a GREEN integrity classification, the gateway never
-turns that into trading permission.
-The gateway reports:
-data integrity
-source quality
-freshness
-cross-validation
-execution authorization state
-but it does not make the trading decision.
-MCP tools
-`asx_get_quotes`
-`asx_get_quote`
-`asx_get_depth`
-`asx_get_health`
-`asx_run_gateway_test`
-Alpic build settings
-Install command:
-`uv venv && uv pip install -r requirements.txt`
-Start command:
-`uv run server.py`
-Runtime:
-Python 3.13
-Transport:
-streamable-http
-Environment variables
-Required:
+# ASX MAXIMUM EDGE™ V8-I — Data Gateway V3
+
+## Purpose
+
+V3 is the timestamped market-data integrity layer for the V8-I Professional Intraday Live Execution Edition.
+
+The design separates:
+
+1. upstream market-data timestamp;
+2. gateway receipt timestamp;
+3. measured market-data age;
+4. HTTP/request latency;
+5. source quality;
+6. cross-source corroboration;
+7. execution authorization.
+
+**Request latency is never treated as market-data age.**
+
+## Primary source: iTick
+
+When `ITICK_API_TOKEN` is configured, iTick is the primary ASX quote source.
+The iTick `/stock/quotes` response documents `t` as the timestamp of the latest trade and supports Australia (`region=AU`).
+
+The gateway records:
+
+- `source_timestamp`
+- `gateway_received_at`
+- `freshness.age_seconds`
+- `freshness.classification`
+- `source_timestamp_kind`
+- `request_latency_ms`
+- per-field timestamps
+- raw-record SHA-256 hash
+
+Freshness classes:
+
+- GREEN: <= 60 s
+- AMBER: <= 180 s
+- ORANGE: <= 900 s
+- RED: invalid/stale/future/inconsistent
+- UNKNOWN: source age cannot be verified
+
+Thresholds are configurable by environment variables.
+
+## Secondary sources
+
+### Migizi
+
+Retained as an independent price corroboration source. In the current integration it does not provide a verified upstream source timestamp, so it cannot prove freshness. Agreement with iTick is reported as `PRICE_CORROBORATED`, not temporal cross-validation.
+
+### Yahoo Finance
+
+Optional and disabled by default in V3. It is reference/corroboration only and cannot grant execution-grade status.
+
+## Depth
+
+iTick REST depth is available through `asx_get_depth(symbol)`. The documented REST depth response provides bid/ask levels but does not expose a source timestamp. V3 therefore marks depth freshness `UNKNOWN` and never borrows the quote timestamp as a depth timestamp.
+
+This is deliberate. A future streaming implementation may use timestamped events if the authorized iTick stock WebSocket actually provides sufficient timestamp information for the subscribed ASX depth stream.
+
+## Tick data
+
+`asx_get_ticks()` uses iTick `/stock/ticks` and preserves the transaction timestamp `t`. It is useful for validating whether the Australian feed is genuinely updating at transaction level.
+
+## Free-plan conservation
+
+The V3 Tier-1 gateway test uses one iTick batch quote request per snapshot. Three snapshots therefore use three REST calls, avoiding unnecessary depth/tick calls under a 5 calls/minute Free Plan configuration.
+
+## Execution authorization
+
+`V8I_EXECUTION_AUTHORIZED=false` by default.
+
+No GREEN quote, quality score, source timestamp, cross-validation result, or gateway health state can authorize a trade.
+
+## Environment setup
+
+1. Copy `.env.example` to your deployment environment.
+2. Put the iTick token in the environment variable `ITICK_API_TOKEN` only.
+3. Never place the token in `server.py`, README, GitHub, screenshots, or chat.
+4. Deploy with:
+
 ```text
-ASX_API_URL=https://migizitech.wixsite.com/asxprices/_functions/getasxprices
-ASX_API_KEY=free
+Install: uv venv && uv pip install -r requirements.txt
+Start:   uv run server.py
+Python:  3.13
+Transport: streamable-http
 ```
-Recommended:
-```text
-ENABLE_YAHOO_SOURCE=true
-V8I_EXECUTION_AUTHORIZED=false
-V8I_DEFAULT_SYMBOLS=CBA,BHP,WGX,CBE,WLC
-V8I_GREEN_MAX_AGE_SECONDS=60
-V8I_AMBER_MAX_AGE_SECONDS=180
-V8I_ORANGE_MAX_AGE_SECONDS=900
-V8I_CROSS_MAX_TIME_DELTA_SECONDS=120
-V8I_CROSS_MAX_PRICE_DIFF_PCT=0.50
-```
-V2 acceptance sequence
-Deploy successfully.
-Run `asx_get_health`.
-Run `asx_get_quotes` for CBA/BHP/WGX/CBE/WLC.
-Run `asx_get_depth` separately.
-Run `asx_run_gateway_test`.
-Inspect source timestamps and freshness classifications.
-Confirm cross-validation status.
-Confirm execution authorization remains separate.
-Only then connect V2 to V8-I.
-Safety principle
-Successful API acquisition is not the same thing as verified live-market
-freshness.
-V2 is intentionally conservative:
-NO TIMESTAMP → UNKNOWN
-STALE → REJECT
-INCONSISTENT → REJECT
-GREEN ≠ BUY
-DATA INTEGRITY ≠ EXECUTION AUTHORIZATION
+
+## MCP tools
+
+- `asx_get_quotes(symbols)`
+- `asx_get_quote(symbol)`
+- `asx_get_ticks(symbols)`
+- `asx_get_depth(symbol)`
+- `asx_get_health()`
+- `asx_run_gateway_test()`
+
+## Promotion rule
+
+V3 is **not** declared execution-grade merely because iTick returns timestamps. Promotion requires empirical testing of:
+
+- timestamp freshness;
+- repeated quote consistency;
+- Australian symbol coverage;
+- source update behaviour during live ASX trading;
+- tick-level timestamps;
+- depth behaviour;
+- source/licensing terms;
+- operational failure handling;
+- independent corroboration where available.
+
+ASX itself distinguishes direct real-time MarketSource data from third-party vendor feeds. ASX says MarketSource supplies real-time Level 1, Level 2, trades and instrument status, and can be accessed directly or through vendors. V3 therefore treats iTick as a candidate third-party source until empirically and contractually validated for the intended use.

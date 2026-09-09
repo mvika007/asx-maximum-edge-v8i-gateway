@@ -1,26 +1,41 @@
 {
-  "gateway": "ASX MAXIMUM EDGE V8-I DATA GATEWAY V2",
-  "required_symbols": [
-    "CBA",
-    "BHP",
-    "WGX",
-    "CBE",
-    "WLC"
+  "name": "ASX MAXIMUM EDGE V8-I Data Gateway V3 Tier-1 Timestamp Acceptance Test",
+  "version": "3.0",
+  "default_symbols": ["CBA", "BHP", "WGX", "CBE", "WLC"],
+  "primary_source": "iTick",
+  "primary_endpoint": "/stock/quotes",
+  "primary_timestamp_field": "t",
+  "timestamp_semantics": "latest trade timestamp",
+  "freshness_thresholds_seconds": {
+    "GREEN": 60,
+    "AMBER": 180,
+    "ORANGE": 900
+  },
+  "red_conditions": [
+    "source timestamp in future beyond tolerance",
+    "invalid required field",
+    "internal field inconsistency",
+    "stale beyond ORANGE threshold",
+    "temporal price disagreement when sources are comparable"
   ],
-  "tests": [
-    "three consecutive snapshots",
-    "all required symbols present",
-    "required quote fields valid",
-    "source timestamps audited",
-    "data age classified",
-    "cross-source validation attempted when temporally comparable",
-    "stale/inconsistent observations rejected",
-    "depth clock evaluated independently",
-    "execution authorization remains separate"
+  "unknown_conditions": [
+    "missing source timestamp",
+    "incomplete required fields",
+    "depth response without source timestamp"
   ],
-  "promotion_policy": {
-    "engineering_pass": "acquisition + repeatability + field integrity",
-    "integrity_pass": "verified timestamps + acceptable age + no hard contradictions",
-    "execution_authorization": "never granted by data integrity score"
-  }
+  "tier_1": {
+    "snapshots": 3,
+    "spacing_seconds": 2,
+    "quote_calls_per_snapshot": 1,
+    "purpose": "prove timestamped acquisition and repeatability without exhausting iTick Free Plan 5 calls/minute"
+  },
+  "promotion_requirements": [
+    "three complete snapshots",
+    "iTick timestamp present for every default symbol",
+    "no RED primary quote",
+    "at least one GREEN primary observation",
+    "execution authorization remains separate and must not be inferred"
+  ],
+  "depth_rule": "Depth freshness cannot inherit quote timestamp. The current REST depth response is UNKNOWN unless its own source timestamp is supplied.",
+  "cross_validation_rule": "A timestamp-less secondary source may corroborate price but cannot prove temporal freshness."
 }
