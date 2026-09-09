@@ -8,11 +8,12 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from typing import Any, Optional
+from collections import deque
 
 import httpx
 from mcp.server import MCPServer
 
-mcp = MCPServer("ASX MAXIMUM EDGE V8-I Data Gateway V3")
+mcp = MCPServer("ASX MAXIMUM EDGE V8-I Data Gateway V3.1")
 
 # ---------------------------------------------------------------------------
 # V3 purpose
@@ -68,6 +69,41 @@ CROSS_MAX_PRICE_DIFF_PCT = float(os.getenv("V8I_CROSS_MAX_PRICE_DIFF_PCT", "0.50
 
 HTTP_TIMEOUT = float(os.getenv("V8I_HTTP_TIMEOUT_SECONDS", "15"))
 ITICK_FREE_REST_LIMIT_PER_MINUTE = int(os.getenv("ITICK_FREE_REST_LIMIT_PER_MINUTE", "5"))
+ITICK_RATE_LIMIT_SAFETY_MARGIN = int(os.getenv("ITICK_RATE_LIMIT_SAFETY_MARGIN", "1"))
+ITICK_TEST_MIN_REMAINING_CALLS = int(os.getenv("ITICK_TEST_MIN_REMAINING_CALLS", "3"))
+
+# Process-local rolling-window accounting. This is diagnostic protection, not a
+# substitute for the provider's server-side rate limiter. It prevents V3.1 from
+# blindly firing a Tier-1 test when the Free Plan budget is already exhausted.
+_ITICK_CALL_TIMES = deque()
+_ITICK_CALL_LOCK = asyncio.Lock()
+
+async def itick_budget_status(reserve_calls: int = 0) -> dict:
+    now = time.monotonic()
+    async with _ITICK_CALL_LOCK:
+        while _ITICK_CALL_TIMES and now - _ITICK_CALL_TIMES[0] >= 60:
+            _ITICK_CALL_TIMES.popleft()
+        used = len(_ITICK_CALL_TIMES)
+        effective_limit = max(0, ITICK_FREE_REST_LIMIT_PER_MINUTE - ITICK_RATE_LIMIT_SAFETY_MARGIN)
+        remaining = max(0, effective_limit - used)
+        return {
+            "configured_limit_calls_per_minute": ITICK_FREE_REST_LIMIT_PER_MINUTE,
+            "safety_margin_calls": ITICK_RATE_LIMIT_SAFETY_MARGIN,
+            "effective_soft_limit_calls_per_minute": effective_limit,
+            "tracked_calls_last_60s": used,
+            "tracked_remaining_soft_budget": remaining,
+            "reserve_requested": reserve_calls,
+            "reserve_available": remaining >= reserve_calls,
+            "next_budget_release_seconds": round(max(0.0, 60 - (now - _ITICK_CALL_TIMES[0])) if _ITICK_CALL_TIMES else 0.0, 2),
+            "tracking_scope": "current_gateway_process only",
+        }
+
+async def record_itick_call() -> None:
+    async with _ITICK_CALL_LOCK:
+        now = time.monotonic()
+        while _ITICK_CALL_TIMES and now - _ITICK_CALL_TIMES[0] >= 60:
+            _ITICK_CALL_TIMES.popleft()
+        _ITICK_CALL_TIMES.append(now)
 
 # Execution authorization is completely independent and defaults to false.
 EXECUTION_AUTHORIZED = os.getenv("V8I_EXECUTION_AUTHORIZED", "false").lower() in {
@@ -282,20 +318,47 @@ class ITickSource(MarketDataSource):
     def configured(self) -> bool:
         return bool(self.token)
 
-    async def _request(self, path: str, params: dict) -> tuple[Any, float, datetime, Optional[str]]:
+    async def _request(self, path: str, params: dict) -> tuple[Any, float, datetime, Optional[str], dict]:
         if not self.token:
             raise RuntimeError("ITICK_API_TOKEN is not configured")
         started = time.monotonic()
+        url = f"{self.base_url}/{path.lstrip('/')}"
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
-            response = await client.get(
-                f"{self.base_url}/{path.lstrip('/')}",
-                params=params,
-                headers={"accept": "application/json", "token": self.token},
-            )
-            received_at = now_utc()
-            response.raise_for_status()
-            payload = response.json()
-            return payload, round((time.monotonic() - started) * 1000, 2), received_at, response.headers.get("date")
+            try:
+                response = await client.get(
+                    url,
+                    params=params,
+                    headers={"accept": "application/json", "token": self.token},
+                )
+                received_at = now_utc()
+                latency_ms = round((time.monotonic() - started) * 1000, 2)
+                await record_itick_call()
+                body_text = response.text[:2000]
+                try:
+                    payload = response.json()
+                except Exception:
+                    payload = None
+                telemetry = {
+                    "url": url,
+                    "endpoint": f"/{path.lstrip('/')}",
+                    "http_status": response.status_code,
+                    "request_latency_ms": latency_ms,
+                    "gateway_received_at": iso(received_at),
+                    "server_date_header": response.headers.get("date"),
+                    "retry_after_header": response.headers.get("retry-after"),
+                    "rate_limit_headers": {
+                        k: v for k, v in response.headers.items()
+                        if "rate" in k.lower() or "limit" in k.lower() or "remaining" in k.lower()
+                    },
+                    "response_body_preview": body_text if response.status_code >= 400 else None,
+                }
+                if response.status_code >= 400:
+                    return payload if payload is not None else {"code": response.status_code, "msg": body_text}, latency_ms, received_at, response.headers.get("date"), telemetry
+                return payload, latency_ms, received_at, response.headers.get("date"), telemetry
+            except Exception:
+                # Network/transport exceptions may occur before an HTTP response
+                # exists; do not count an unissued request against the budget.
+                raise
 
     def _normalize_quote(self, record: dict, requested: str, latency_ms: float) -> NormalizedQuote:
         symbol = normalize_symbol(pick(record, "s", "symbol", "Symbol", "code", "Code") or requested)
@@ -344,32 +407,97 @@ class ITickSource(MarketDataSource):
 
     async def get_quotes(self, symbols: list[str]) -> dict:
         if not self.configured:
-            return {"source": self.name, "available": False, "configured": False, "error": "ITICK_API_TOKEN not configured", "quotes": {}}
+            return {"source": self.name, "available": False, "configured": False, "error": "ITICK_API_TOKEN not configured", "quotes": {}, "diagnostics": {"stage": "configuration"}}
+        symbols = [normalize_symbol(x) for x in symbols]
+        budget_before = await itick_budget_status()
         params = {"region": self.region, "codes": ",".join(symbols)}
         if self.exchange:
             params["exchange"] = self.exchange
         try:
-            payload, latency_ms, received_at, server_date = await self._request("quotes", params)
+            payload, latency_ms, received_at, server_date, telemetry = await self._request("quotes", params)
         except Exception as exc:
-            return {"source": self.name, "available": False, "configured": True, "error": repr(exc), "quotes": {}}
+            return {
+                "source": self.name, "available": False, "configured": True, "error": repr(exc), "quotes": {},
+                "diagnostics": {"stage": "transport", "budget_before": budget_before, "exception": repr(exc)},
+            }
 
-        if payload.get("code") not in (None, 0):
-            return {"source": self.name, "available": False, "configured": True, "error": payload.get("msg") or f"iTick code={payload.get('code')}", "quotes": {}}
+        response_code = payload.get("code") if isinstance(payload, dict) else None
+        response_msg = payload.get("msg") if isinstance(payload, dict) else None
+        if response_code not in (None, 0):
+            return {
+                "source": self.name, "available": False, "configured": True,
+                "error": response_msg or f"iTick code={response_code}", "quotes": {},
+                "received_at": iso(received_at), "request_latency_ms": latency_ms,
+                "endpoint": "/stock/quotes", "region": self.region,
+                "diagnostics": {
+                    "stage": "provider_response", "http_status": telemetry.get("http_status"),
+                    "provider_code": response_code, "provider_message": response_msg,
+                    "budget_before": budget_before, "budget_after": await itick_budget_status(),
+                    "telemetry": telemetry,
+                },
+            }
 
-        raw_data = payload.get("data") or {}
-        records = list(raw_data.values()) if isinstance(raw_data, dict) else extract_records(raw_data)
+        raw_data = payload.get("data") if isinstance(payload, dict) else None
+        records_with_keys = []
+        if isinstance(raw_data, dict):
+            for key, value in raw_data.items():
+                if isinstance(value, dict):
+                    records_with_keys.append((str(key), value))
+        elif isinstance(raw_data, list):
+            records_with_keys = [("", x) for x in raw_data if isinstance(x, dict)]
+        else:
+            records = extract_records(raw_data)
+            records_with_keys = [("", x) for x in records]
+
+        requested_set = set(symbols)
         quotes = {}
-        for record in records:
-            q = self._normalize_quote(record, "", latency_ms)
-            if q.symbol in {normalize_symbol(s) for s in symbols}:
-                quotes[q.symbol] = q
+        timestamp_presence = {}
+        unmatched_records = []
+        for key, record in records_with_keys:
+            fallback_symbol = normalize_symbol(key) if key else ""
+            q = self._normalize_quote(record, fallback_symbol, latency_ms)
+            if not q.symbol and fallback_symbol:
+                q.symbol = fallback_symbol
+            timestamp_presence[q.symbol or fallback_symbol] = {
+                "t_present": pick(record, "t", "timestamp", "Timestamp") is not None,
+                "t_raw": pick(record, "t", "timestamp", "Timestamp"),
+                "t_parsed": q.source_timestamp,
+                "source_timestamp_verified": q.source_timestamp_verified,
+            }
+            symbol = q.symbol or fallback_symbol
+            if symbol in requested_set:
+                quotes[symbol] = q
+            else:
+                unmatched_records.append({"response_key": key, "resolved_symbol": symbol, "record_keys": sorted(record.keys())})
+
+        missing_symbols = [s for s in symbols if s not in quotes]
+        missing_timestamps = [s for s, q in quotes.items() if not q.source_timestamp_verified]
+        budget_after = await itick_budget_status()
+        diagnostics = {
+            "stage": "parsed_successfully",
+            "http_status": telemetry.get("http_status"),
+            "provider_code": response_code,
+            "provider_message": response_msg,
+            "requested_symbols": symbols,
+            "response_data_type": type(raw_data).__name__,
+            "raw_record_count": len(records_with_keys),
+            "returned_symbols": sorted(quotes.keys()),
+            "missing_symbols": missing_symbols,
+            "missing_timestamps": missing_timestamps,
+            "timestamp_presence": timestamp_presence,
+            "unmatched_records": unmatched_records,
+            "budget_before": budget_before,
+            "budget_after": budget_after,
+            "telemetry": telemetry,
+        }
         return {
             "source": self.name, "available": True, "configured": True,
             "received_at": iso(received_at), "request_latency_ms": latency_ms,
             "source_server_date_header": server_date,
             "endpoint": "/stock/quotes", "region": self.region,
-            "quotes": quotes, "raw_record_count": len(records),
-            "note": "iTick t is treated as the upstream latest-trade timestamp; gateway latency is measured separately.",
+            "quotes": quotes, "raw_record_count": len(records_with_keys),
+            "diagnostics": diagnostics,
+            "note": "iTick t is treated as the upstream latest-trade timestamp; gateway receipt and request latency are measured separately.",
         }
 
     async def get_ticks(self, symbols: list[str]) -> dict:
@@ -379,7 +507,7 @@ class ITickSource(MarketDataSource):
         if self.exchange:
             params["exchange"] = self.exchange
         try:
-            payload, latency_ms, received_at, server_date = await self._request("ticks", params)
+            payload, latency_ms, received_at, server_date, telemetry = await self._request("ticks", params)
         except Exception as exc:
             return {"source": self.name, "available": False, "error": repr(exc)}
         if payload.get("code") not in (None, 0):
@@ -400,7 +528,7 @@ class ITickSource(MarketDataSource):
         return {
             "source": self.name, "available": True, "endpoint": "/stock/ticks",
             "gateway_received_at": iso(received_at), "request_latency_ms": latency_ms,
-            "source_server_date_header": server_date, "ticks": out,
+            "source_server_date_header": server_date, "ticks": out, "diagnostics": {"telemetry": telemetry, "budget": await itick_budget_status()},
             "note": "Tick timestamps are source transaction timestamps. Informational/licensing restrictions must be respected.",
         }
 
@@ -411,7 +539,7 @@ class ITickSource(MarketDataSource):
         if self.exchange:
             params["exchange"] = self.exchange
         try:
-            payload, latency_ms, received_at, server_date = await self._request("depth", params)
+            payload, latency_ms, received_at, server_date, telemetry = await self._request("depth", params)
         except Exception as exc:
             return {"source": self.name, "available": False, "error": repr(exc)}
         if payload.get("code") not in (None, 0):
@@ -426,7 +554,7 @@ class ITickSource(MarketDataSource):
             "symbol": normalize_symbol(symbol), "asks": asks, "bids": bids,
             "source_timestamp": None, "source_timestamp_verified": False,
             "gateway_received_at": iso(received_at), "request_latency_ms": latency_ms,
-            "source_server_date_header": server_date,
+            "source_server_date_header": server_date, "diagnostics": {"telemetry": telemetry, "budget": await itick_budget_status()},
             "freshness": {"classification": "UNKNOWN", "age_seconds": None, "reason": "iTick_depth_response_has_no_documented_source_timestamp"},
             "note": "Do not infer depth age from quote timestamp or gateway request latency. Depth requires its own timestamped stream to become freshness-verifiable.",
         }
@@ -542,18 +670,27 @@ def enrich(q: NormalizedQuote, gateway_received_at: datetime, cross: dict) -> di
 
 @mcp.tool()
 async def asx_get_quotes(symbols: list[str] | None = None) -> dict:
-    """V3 primary timestamped quote pipeline. iTick is primary when configured; secondary sources are corroboration only."""
+    """V3.1 primary timestamped quote pipeline with source diagnostics and rate-limit telemetry."""
     syms=[normalize_symbol(x) for x in (symbols or DEFAULT_SYMBOLS) if normalize_symbol(x)]
-    gateway_received_at=now_utc(); source_results=await fetch_quotes(syms); output={}
+    source_results=await fetch_quotes(syms)
+    gateway_received_at=now_utc()
+    output={}
     for symbol in syms:
         cross=temporal_cross_validation(symbol,source_results)
-        output[symbol]={name:enrich(q,gateway_received_at,cross) for name,res in source_results.items() if (q:=res.get("quotes",{}).get(symbol)) is not None}
+        output[symbol]={}
+        for name,res in source_results.items():
+            q=res.get("quotes",{}).get(symbol)
+            if q is None:
+                continue
+            receipt=parse_timestamp(res.get("received_at")) or gateway_received_at
+            output[symbol][name]=enrich(q,receipt,cross)
     return {
-        "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3",
+        "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.1",
         "gateway_received_at":iso(gateway_received_at),
-        "timestamp_model":{"source_timestamp":"iTick t = latest trade timestamp","gateway_timestamp":"local UTC receipt time","measured_age":"gateway_received_at - source_timestamp","request_latency_is_not_market_data_age":True},
-        "symbols":syms,"sources":{name:{k:res.get(k) for k in ("available","configured","error","errors","received_at","request_latency_ms","endpoint","region","note")} for name,res in source_results.items()},
+        "timestamp_model":{"source_timestamp":"iTick t = latest trade timestamp","source_gateway_receipt":"source HTTP response receipt timestamp","measured_age":"source_gateway_receipt - source_timestamp","request_latency_is_not_market_data_age":True},
+        "symbols":syms,"sources":{name:{k:res.get(k) for k in ("available","configured","error","errors","received_at","request_latency_ms","endpoint","region","note","diagnostics")} for name,res in source_results.items()},
         "quotes":output,"execution_authorization":execution_authorization(),
+        "itick_budget":await itick_budget_status(),
         "policy":{"missing_source_timestamp":"UNKNOWN","GREEN_requires_verified_source_age":True,"stale_or_invalid":"RED","temporal_cross_validation_required_for_secondary_timestamp_claim":True,"price_corroboration_never_proves_freshness":True},
     }
 
@@ -570,7 +707,7 @@ async def asx_get_ticks(symbols: list[str] | None = None) -> dict:
     syms=[normalize_symbol(x) for x in (symbols or DEFAULT_SYMBOLS) if normalize_symbol(x)]
     src=ITickSource(ITICK_BASE_URL,ITICK_TOKEN,ITICK_REGION,ITICK_EXCHANGE)
     result=await src.get_ticks(syms)
-    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3","execution_authorization":execution_authorization(),"tick_result":result}
+    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.1","execution_authorization":execution_authorization(),"tick_result":result}
 
 
 @mcp.tool()
@@ -578,15 +715,15 @@ async def asx_get_depth(symbol: str) -> dict:
     """Fetch iTick Level-2 depth for one symbol. Depth freshness remains UNKNOWN unless the upstream response carries its own timestamp."""
     src=ITickSource(ITICK_BASE_URL,ITICK_TOKEN,ITICK_REGION,ITICK_EXCHANGE)
     result=await src.get_depth(normalize_symbol(symbol))
-    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3","quote_and_depth_clocks_separate":True,"execution_authorization":execution_authorization(),"depth_result":result}
+    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.1","quote_and_depth_clocks_separate":True,"execution_authorization":execution_authorization(),"depth_result":result}
 
 
 @mcp.tool()
 async def asx_get_health() -> dict:
-    """Return V3 health, timestamp model, source configuration and execution authorization."""
+    """Return V3.1 health, timestamp model, source configuration, rate-limit diagnostics and execution authorization."""
     itick_configured=bool(ITICK_TOKEN)
     return {
-        "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3","status":"READY","timestamp_utc":iso(now_utc()),
+        "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.1","status":"READY","timestamp_utc":iso(now_utc()),
         "primary_source":{"name":"iTick","configured":itick_configured,"region":ITICK_REGION,"base_url":ITICK_BASE_URL,"role":"primary_timestamped_quote_source","source_timestamp_field":"t","source_timestamp_semantics":"latest trade timestamp","execution_grade":"NOT_GRANTED_BY_CONFIGURATION"},
         "secondary_sources":[
             {"name":"ASX Equity Stocks / Migizi Tech","enabled":ENABLE_MIGIZI,"role":"price corroboration; no verified source timestamp in this integration"},
@@ -595,6 +732,7 @@ async def asx_get_health() -> dict:
         "configured_symbols":DEFAULT_SYMBOLS,
         "freshness_classes":{"GREEN":f"verified source age <= {GREEN_MAX_AGE:g}s","AMBER":f"verified source age <= {AMBER_MAX_AGE:g}s","ORANGE":f"verified source age <= {ORANGE_MAX_AGE:g}s","RED":"invalid/stale/inconsistent/future timestamp","UNKNOWN":"source age cannot be verified"},
         "rest_rate_limit_assumption":f"{ITICK_FREE_REST_LIMIT_PER_MINUTE} calls/minute (configure to match plan)",
+        "rate_limit_diagnostics":await itick_budget_status(),
         "execution_authorization":execution_authorization(),
         "critical_policy":"A GREEN quote proves timestamp freshness only. It does not prove exchange licensing, order-book completeness, execution authorization, or trading profitability.",
     }
@@ -602,29 +740,104 @@ async def asx_get_health() -> dict:
 
 @mcp.tool()
 async def asx_run_gateway_test() -> dict:
-    """V3 acceptance test using one iTick batch quote request per snapshot.
-    Three snapshots are spaced 2 seconds apart. It does not call depth/ticks,
-    preserving the Free Plan's 5 REST-calls/minute budget. Promotion requires
-    verified source timestamps and at least one GREEN observation; execution
-    authorization remains separate.
+    """V3.1 Tier-1 diagnostic acceptance test.
+
+    Uses three /stock/quotes batch calls, spaced by 2 seconds, and records the
+    provider response, timestamp presence, returned symbols, missing symbols,
+    rate-limit telemetry and freshness outcome. It fails closed and reports
+    the exact stage of failure rather than silently converting an iTick error
+    into zero timestamp observations.
     """
+    required_calls=3
+    preflight=await itick_budget_status(reserve_calls=required_calls)
+    if not preflight.get("reserve_available"):
+        return {
+            "test":"V8-I Data Gateway V3.1 Tier-1 Timestamp Acceptance Test",
+            "version":"3.1", "run_at_utc":iso(now_utc()), "symbols":DEFAULT_SYMBOLS,
+            "snapshots_completed":0, "failures":[], "preflight":preflight,
+            "per_symbol":{}, "verified_green_observations":[],
+            "acquisition_repeatability_pass":False,
+            "promotion":"DO NOT PROMOTE — INSUFFICIENT iTick RATE-LIMIT BUDGET",
+            "diagnostic_root_cause":"The gateway process has insufficient tracked Free Plan budget for three batch snapshots. Wait for the rolling window to clear and rerun.",
+            "execution_authorization":execution_authorization(),
+        }
+
     snapshots=[]; failures=[]
     for i in range(3):
-        try: snapshots.append(await asx_get_quotes(DEFAULT_SYMBOLS))
-        except Exception as exc: failures.append({"snapshot":i+1,"error":repr(exc)})
-        if i<2: await asyncio.sleep(2)
-    green=[]; per_symbol={}
+        try:
+            snap=await asx_get_quotes(DEFAULT_SYMBOLS)
+            snapshots.append(snap)
+        except Exception as exc:
+            failures.append({"snapshot":i+1,"stage":"gateway_call","error":repr(exc)})
+        if i<2:
+            await asyncio.sleep(2)
+
+    green=[]; per_symbol={}; diagnostic_failures=[]
     for symbol in DEFAULT_SYMBOLS:
-        obs=[]
-        for snap in snapshots:
-            for source,q in snap.get("quotes",{}).get(symbol,{}).items():
-                obs.append({"source":source,"freshness":q.get("freshness"),"integrity":q.get("integrity_classification"),"price":q.get("price"),"source_timestamp":q.get("source_timestamp")})
-                if q.get("freshness",{}).get("classification")=="GREEN": green.append((symbol,source,q.get("freshness",{}).get("age_seconds")))
-        itick_obs=[x for x in obs if x["source"]=="iTick"]
-        per_symbol[symbol]={"observations":len(obs),"iTick_observations":len(itick_obs),"iTick_timestamp_verified":sum(1 for x in itick_obs if x["source_timestamp"]),"iTick_green_count":sum(1 for x in itick_obs if x["freshness"].get("classification")=="GREEN"),"pass":len(itick_obs)==len(snapshots) and all(x["integrity"]!="RED" for x in itick_obs)}
+        observations=[]
+        for idx,snap in enumerate(snapshots, start=1):
+            source_block=snap.get("sources",{}).get("iTick",{})
+            quote=snap.get("quotes",{}).get(symbol,{}).get("iTick")
+            diagnostics=source_block.get("diagnostics") or {}
+            if quote:
+                observations.append({
+                    "snapshot":idx, "price":quote.get("price"),
+                    "source_timestamp":quote.get("source_timestamp"),
+                    "timestamp_verified":quote.get("source_timestamp_verified"),
+                    "freshness":quote.get("freshness"),
+                    "integrity":quote.get("integrity_classification"),
+                    "quality_score":(quote.get("quality") or {}).get("score"),
+                })
+                if quote.get("freshness",{}).get("classification")=="GREEN":
+                    green.append((symbol,idx,quote.get("freshness",{}).get("age_seconds")))
+            else:
+                diagnostic_failures.append({
+                    "symbol":symbol,"snapshot":idx,
+                    "source_available":source_block.get("available"),
+                    "source_error":source_block.get("error"),
+                    "http_status":diagnostics.get("http_status"),
+                    "provider_code":diagnostics.get("provider_code"),
+                    "provider_message":diagnostics.get("provider_message"),
+                    "returned_symbols":diagnostics.get("returned_symbols"),
+                    "missing_symbols":diagnostics.get("missing_symbols"),
+                    "missing_timestamps":diagnostics.get("missing_timestamps"),
+                    "timestamp_presence":diagnostics.get("timestamp_presence"),
+                    "budget_after":diagnostics.get("budget_after"),
+                })
+        timestamped=sum(1 for x in observations if x["timestamp_verified"])
+        greens=sum(1 for x in observations if x["freshness"].get("classification")=="GREEN")
+        red=sum(1 for x in observations if x["integrity"]=="RED")
+        per_symbol[symbol]={
+            "observations":len(observations),
+            "expected_snapshots":len(snapshots),
+            "iTick_timestamp_verified":timestamped,
+            "iTick_green_count":greens,
+            "red_count":red,
+            "pass":len(observations)==len(snapshots)==3 and timestamped==3 and red==0,
+            "observations_detail":observations,
+        }
+
     acquisition=not failures and len(snapshots)==3 and all(v["pass"] for v in per_symbol.values())
-    promotion="V3 TIMESTAMP GATE PASSED — EXECUTION AUTHORIZATION REMAINS SEPARATE" if acquisition and green else ("ENGINEERING ACQUISITION PASS — FRESHNESS NOT PROVEN" if acquisition else "DO NOT PROMOTE")
-    return {"test":"V8-I Data Gateway V3 Tier-1 Timestamp Acceptance Test","run_at_utc":iso(now_utc()),"symbols":DEFAULT_SYMBOLS,"snapshots_completed":len(snapshots),"failures":failures,"per_symbol":per_symbol,"verified_green_observations":green,"acquisition_repeatability_pass":acquisition,"execution_authorization":execution_authorization(),"promotion":promotion,"important":["iTick source t is the only freshness clock for primary quotes.","Gateway request latency is never treated as market-data age.","Migizi/Yahoo price agreement cannot certify freshness when their source timestamps are absent/stale.","Depth requires its own timestamped source before it can be marked GREEN."]}
+    promotion=("V3.1 TIMESTAMP GATE PASSED — EXECUTION AUTHORIZATION REMAINS SEPARATE" if acquisition and green
+               else "DO NOT PROMOTE")
+    return {
+        "test":"V8-I Data Gateway V3.1 Tier-1 Timestamp Acceptance Test",
+        "version":"3.1", "run_at_utc":iso(now_utc()), "symbols":DEFAULT_SYMBOLS,
+        "snapshots_completed":len(snapshots), "failures":failures,
+        "preflight":preflight, "post_test_budget":await itick_budget_status(),
+        "per_symbol":per_symbol, "verified_green_observations":green,
+        "diagnostic_failures":diagnostic_failures,
+        "acquisition_repeatability_pass":acquisition,
+        "execution_authorization":execution_authorization(),
+        "promotion":promotion,
+        "important":[
+            "iTick source t is the only freshness clock for primary quotes.",
+            "Gateway request latency is never treated as market-data age.",
+            "Provider/API/rate-limit errors are surfaced explicitly and are never converted into missing-timestamp observations.",
+            "The batch parser preserves response dictionary keys as symbol fallbacks.",
+            "Depth requires its own timestamped source before it can be marked GREEN."
+        ],
+    }
 
 
 if __name__ == "__main__":

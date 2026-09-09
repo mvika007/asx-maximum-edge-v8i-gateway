@@ -1,16 +1,12 @@
 {
-  "name": "ASX MAXIMUM EDGE V8-I Data Gateway V3 Tier-1 Timestamp Acceptance Test",
-  "version": "3.0",
+  "name": "ASX MAXIMUM EDGE V8-I Data Gateway V3.1 Tier-1 Timestamp Acceptance Test",
+  "version": "3.1",
   "default_symbols": ["CBA", "BHP", "WGX", "CBE", "WLC"],
   "primary_source": "iTick",
   "primary_endpoint": "/stock/quotes",
   "primary_timestamp_field": "t",
   "timestamp_semantics": "latest trade timestamp",
-  "freshness_thresholds_seconds": {
-    "GREEN": 60,
-    "AMBER": 180,
-    "ORANGE": 900
-  },
+  "freshness_thresholds_seconds": {"GREEN": 60, "AMBER": 180, "ORANGE": 900},
   "red_conditions": [
     "source timestamp in future beyond tolerance",
     "invalid required field",
@@ -27,15 +23,27 @@
     "snapshots": 3,
     "spacing_seconds": 2,
     "quote_calls_per_snapshot": 1,
-    "purpose": "prove timestamped acquisition and repeatability without exhausting iTick Free Plan 5 calls/minute"
+    "purpose": "prove timestamped acquisition and repeatability while preserving the iTick Free Plan budget"
+  },
+  "diagnostics": {
+    "provider_http_status": true,
+    "provider_code_and_message": true,
+    "returned_symbols": true,
+    "missing_symbols": true,
+    "raw_timestamp_presence": true,
+    "parsed_timestamp": true,
+    "rolling_window_budget": true,
+    "rate_limit_headers": true,
+    "response_body_preview_on_http_error": true
   },
   "promotion_requirements": [
     "three complete snapshots",
-    "iTick timestamp present for every default symbol",
+    "iTick timestamp present for every default symbol in every snapshot",
     "no RED primary quote",
     "at least one GREEN primary observation",
     "execution authorization remains separate and must not be inferred"
   ],
+  "failure_policy": "Provider errors, rate-limit exhaustion, missing symbols and missing timestamps are surfaced as explicit diagnostic failures; they are never silently converted into zero timestamp observations.",
   "depth_rule": "Depth freshness cannot inherit quote timestamp. The current REST depth response is UNKNOWN unless its own source timestamp is supplied.",
   "cross_validation_rule": "A timestamp-less secondary source may corroborate price but cannot prove temporal freshness."
 }

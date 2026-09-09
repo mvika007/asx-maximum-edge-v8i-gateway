@@ -1,4 +1,4 @@
-# ASX MAXIMUM EDGE™ V8-I — Data Gateway V3
+# ASX MAXIMUM EDGE™ V8-I — Data Gateway V3.1
 
 ## Purpose
 
@@ -110,3 +110,12 @@ V3 is **not** declared execution-grade merely because iTick returns timestamps. 
 - independent corroboration where available.
 
 ASX itself distinguishes direct real-time MarketSource data from third-party vendor feeds. ASX says MarketSource supplies real-time Level 1, Level 2, trades and instrument status, and can be accessed directly or through vendors. V3 therefore treats iTick as a candidate third-party source until empirically and contractually validated for the intended use.
+
+
+## V3.1 diagnostic/rate-limit hardening
+
+V3.1 retains the V3 timestamp architecture and adds fail-closed diagnostics for iTick batch quote acquisition. The acceptance test now records HTTP status, provider code/message, returned and missing symbols, raw `t` presence, parsed timestamps, rate-limit telemetry, response previews on HTTP errors, and the gateway's process-local rolling call budget. It will not silently convert an API/rate-limit/provider failure into a "zero verified timestamps" result.
+
+The Free Plan is documented by iTick as 5 REST calls/minute. V3.1 reserves three calls before the Tier-1 test and applies a one-call safety margin by default. The process-local budget is diagnostic only and does not replace the provider's server-side limit.
+
+V3.1 also fixes two integrity issues in the V3 implementation: batch response dictionary keys are retained as symbol fallbacks, and measured freshness uses the actual source HTTP response receipt time rather than a timestamp captured before the source request.
