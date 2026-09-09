@@ -1,49 +1,53 @@
 {
-  "name": "ASX MAXIMUM EDGE V8-I Data Gateway V3.1 Tier-1 Timestamp Acceptance Test",
-  "version": "3.1",
-  "default_symbols": ["CBA", "BHP", "WGX", "CBE", "WLC"],
-  "primary_source": "iTick",
-  "primary_endpoint": "/stock/quotes",
-  "primary_timestamp_field": "t",
-  "timestamp_semantics": "latest trade timestamp",
-  "freshness_thresholds_seconds": {"GREEN": 60, "AMBER": 180, "ORANGE": 900},
-  "red_conditions": [
-    "source timestamp in future beyond tolerance",
-    "invalid required field",
-    "internal field inconsistency",
-    "stale beyond ORANGE threshold",
-    "temporal price disagreement when sources are comparable"
-  ],
-  "unknown_conditions": [
-    "missing source timestamp",
-    "incomplete required fields",
-    "depth response without source timestamp"
-  ],
+  "version": "3.2",
+  "title": "ASX MAXIMUM EDGE V8-I Data Gateway V3.2 Acceptance Specification",
+  "design_goal": "Prove timestamped single-symbol repeatability on the Free plan without forcing multi-symbol batch behavior to pass.",
   "tier_1": {
-    "snapshots": 3,
+    "name": "Single-symbol timestamp repeatability",
+    "tool": "asx_run_gateway_test",
+    "endpoint": "/stock/quote",
+    "default_symbol": "BHP",
+    "calls": 3,
     "spacing_seconds": 2,
-    "quote_calls_per_snapshot": 1,
-    "purpose": "prove timestamped acquisition and repeatability while preserving the iTick Free Plan budget"
+    "pass_conditions": [
+      "3 observations acquired",
+      "all 3 observations contain iTick source timestamp t",
+      "no validation errors",
+      "no RED freshness classifications",
+      "at least one GREEN observation"
+    ],
+    "promotion": "Passes timestamp repeatability only. Execution authorization remains separate."
   },
-  "diagnostics": {
-    "provider_http_status": true,
-    "provider_code_and_message": true,
-    "returned_symbols": true,
-    "missing_symbols": true,
-    "raw_timestamp_presence": true,
-    "parsed_timestamp": true,
-    "rolling_window_budget": true,
-    "rate_limit_headers": true,
-    "response_body_preview_on_http_error": true
+  "breadth": {
+    "tool": "asx_run_breadth_test",
+    "endpoint": "/stock/quote",
+    "cost": "one REST call per symbol",
+    "note": "Run separately from Tier-1 on the Free plan."
   },
-  "promotion_requirements": [
-    "three complete snapshots",
-    "iTick timestamp present for every default symbol in every snapshot",
-    "no RED primary quote",
-    "at least one GREEN primary observation",
-    "execution authorization remains separate and must not be inferred"
-  ],
-  "failure_policy": "Provider errors, rate-limit exhaustion, missing symbols and missing timestamps are surfaced as explicit diagnostic failures; they are never silently converted into zero timestamp observations.",
-  "depth_rule": "Depth freshness cannot inherit quote timestamp. The current REST depth response is UNKNOWN unless its own source timestamp is supplied.",
-  "cross_validation_rule": "A timestamp-less secondary source may corroborate price but cannot prove temporal freshness."
+  "websocket": {
+    "tool": "asx_run_websocket_test",
+    "endpoint": "wss://api-free.itick.org/stock",
+    "rest_calls_consumed": 0,
+    "pass_conditions": [
+      "connection succeeds",
+      "authentication/authorization is observed",
+      "subscription acknowledgement succeeds",
+      "at least one quote/tick event is received",
+      "source timestamp t is present where applicable"
+    ],
+    "promotion": "Proves streaming capability only; does not grant execution authorization."
+  },
+  "batch": {
+    "tool": "asx_test_batch_capability",
+    "endpoint": "/stock/quotes",
+    "required_for_tier_1": false,
+    "failure_policy": "Classify as unavailable/restricted; do not treat as failure of the single-symbol core feed."
+  },
+  "hard_rules": [
+    "Never infer freshness from gateway request latency.",
+    "Never convert provider errors into missing-timestamp observations.",
+    "Never use a secondary timestamp-less source to prove temporal freshness.",
+    "Never grant execution authorization from data integrity alone.",
+    "Never commit API credentials to source control."
+  ]
 }
