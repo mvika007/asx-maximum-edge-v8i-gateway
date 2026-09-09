@@ -1,53 +1,55 @@
 {
-  "version": "3.2",
-  "title": "ASX MAXIMUM EDGE V8-I Data Gateway V3.2 Acceptance Specification",
-  "design_goal": "Prove timestamped single-symbol repeatability on the Free plan without forcing multi-symbol batch behavior to pass.",
-  "tier_1": {
+  "version": "3.3",
+  "title": "ASX MAXIMUM EDGE V8-I Data Gateway V3.3 Acceptance Specification",
+  "design_goal": "Prove timestamped single-symbol REST integrity and measure real WebSocket streaming quality without consuming Free-plan REST quota.",
+  "tier_1_rest": {
     "name": "Single-symbol timestamp repeatability",
     "tool": "asx_run_gateway_test",
     "endpoint": "/stock/quote",
     "default_symbol": "BHP",
     "calls": 3,
     "spacing_seconds": 2,
-    "pass_conditions": [
-      "3 observations acquired",
-      "all 3 observations contain iTick source timestamp t",
-      "no validation errors",
-      "no RED freshness classifications",
-      "at least one GREEN observation"
-    ],
-    "promotion": "Passes timestamp repeatability only. Execution authorization remains separate."
+    "pass_conditions": ["3 observations acquired", "all observations contain source timestamp t", "no validation errors", "no RED freshness classifications", "at least one GREEN observation"],
+    "note": "Timestamp repeatability can pass while live freshness fails. Do not alter thresholds to force promotion."
+  },
+  "websocket_capability": {
+    "tool": "asx_run_websocket_test",
+    "endpoint": "wss://api-free.itick.org/stock",
+    "rest_calls_consumed": 0,
+    "purpose": "Short connection/authentication/subscription capability probe only."
+  },
+  "websocket_streaming_acceptance": {
+    "tool": "asx_run_websocket_streaming_acceptance",
+    "endpoint": "wss://api-free.itick.org/stock",
+    "default_duration_seconds": 120,
+    "recommended_endurance_duration_seconds": 600,
+    "rest_calls_consumed": 0,
+    "event_classes": ["quote", "tick", "depth"],
+    "per_event_fields": ["symbol", "type", "price", "source_timestamp", "gateway_received_at", "age_seconds", "timestamp_verified", "freshness"],
+    "per_symbol_metrics": ["market_events", "fresh_events", "stale_events", "invalid_timestamp_events", "timestamp_progressions", "duplicate_timestamp_events", "min_age_seconds", "median_age_seconds", "max_age_seconds", "max_inter_event_gap_seconds", "event_rate_per_minute"],
+    "statuses": {
+      "FRESH_STREAM": "At least one GREEN event and advancing source timestamps observed.",
+      "FRESH_EVENT": "GREEN event observed but timestamp progression not yet proven.",
+      "STALE_STREAM": "Events observed but no GREEN event observed.",
+      "NO_EVENT": "No market-data event observed; not treated as stale."
+    },
+    "pass_conditions": ["connection succeeds", "authentication observed", "subscription acknowledged", "at least one market-data event received", "at least one GREEN event received", "at least one advancing source-timestamp pair observed", "no invalid/future timestamp events"],
+    "hard_rules": ["NO_EVENT is not STALE_EVENT", "gateway latency is not market-data age", "do not borrow quote timestamps for depth", "execution authorization remains separate"]
   },
   "breadth": {
     "tool": "asx_run_breadth_test",
     "endpoint": "/stock/quote",
     "cost": "one REST call per symbol",
-    "note": "Run separately from Tier-1 on the Free plan."
-  },
-  "websocket": {
-    "tool": "asx_run_websocket_test",
-    "endpoint": "wss://api-free.itick.org/stock",
-    "rest_calls_consumed": 0,
-    "pass_conditions": [
-      "connection succeeds",
-      "authentication/authorization is observed",
-      "subscription acknowledgement succeeds",
-      "at least one quote/tick event is received",
-      "source timestamp t is present where applicable"
-    ],
-    "promotion": "Proves streaming capability only; does not grant execution authorization."
+    "note": "Run separately from REST Tier-1 on the Free plan."
   },
   "batch": {
     "tool": "asx_test_batch_capability",
     "endpoint": "/stock/quotes",
-    "required_for_tier_1": false,
-    "failure_policy": "Classify as unavailable/restricted; do not treat as failure of the single-symbol core feed."
+    "required_for_core_promotion": false,
+    "failure_policy": "Classify as unavailable/restricted; do not treat it as failure of the single-symbol feed."
   },
-  "hard_rules": [
-    "Never infer freshness from gateway request latency.",
-    "Never convert provider errors into missing-timestamp observations.",
-    "Never use a secondary timestamp-less source to prove temporal freshness.",
-    "Never grant execution authorization from data integrity alone.",
-    "Never commit API credentials to source control."
-  ]
+  "execution": {
+    "status": "NOT_GRANTED",
+    "rule": "Data integrity never grants trading execution authorization."
+  }
 }

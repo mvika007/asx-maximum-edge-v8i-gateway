@@ -14,7 +14,7 @@ import httpx
 import websockets
 from mcp.server import MCPServer
 
-mcp = MCPServer("ASX MAXIMUM EDGE V8-I Data Gateway V3.2")
+mcp = MCPServer("ASX MAXIMUM EDGE V8-I Data Gateway V3.3")
 
 # ---------------------------------------------------------------------------
 # V3 purpose
@@ -73,7 +73,12 @@ ITICK_FREE_REST_LIMIT_PER_MINUTE = int(os.getenv("ITICK_FREE_REST_LIMIT_PER_MINU
 ITICK_RATE_LIMIT_SAFETY_MARGIN = int(os.getenv("ITICK_RATE_LIMIT_SAFETY_MARGIN", "1"))
 ITICK_TEST_MIN_REMAINING_CALLS = int(os.getenv("ITICK_TEST_MIN_REMAINING_CALLS", "3"))
 ITICK_WS_URL = os.getenv("ITICK_WS_URL", "wss://api-free.itick.org/stock")
-ITICK_WS_TIMEOUT = float(os.getenv("ITICK_WS_TIMEOUT_SECONDS", "12"))
+ITICK_WS_TIMEOUT = float(os.getenv("ITICK_WS_TIMEOUT_SECONDS", "15"))
+ITICK_WS_ENDURANCE_SECONDS = float(os.getenv("ITICK_WS_ENDURANCE_SECONDS", "120"))
+ITICK_WS_MIN_ACTIVE_SYMBOLS = int(os.getenv("ITICK_WS_MIN_ACTIVE_SYMBOLS", "1"))
+ITICK_WS_MAX_EVENTS = int(os.getenv("ITICK_WS_MAX_EVENTS", "10000"))
+ITICK_WS_MAX_EVENT_AGE = float(os.getenv("ITICK_WS_MAX_EVENT_AGE_SECONDS", "60"))
+ITICK_WS_MAX_STATIONARY_EVENTS = int(os.getenv("ITICK_WS_MAX_STATIONARY_EVENTS", "3"))
 ITICK_WS_TEST_SYMBOLS = [s.strip().upper() for s in os.getenv("ITICK_WS_TEST_SYMBOLS", "BHP,CBA,WGX").split(",") if s.strip()]
 ITICK_WS_TEST_TYPES = os.getenv("ITICK_WS_TEST_TYPES", "quote").strip() or "quote"
 
@@ -357,110 +362,260 @@ class MarketDataSource(ABC):
         raise NotImplementedError
 
     async def websocket_test(self, symbols: list[str], types: str = "quote", timeout: float = ITICK_WS_TIMEOUT) -> dict:
-        """Test free-plan stock WebSocket capability without consuming REST quota."""
+        """Short capability probe. Does not consume REST quota."""
+        return await self._websocket_stream_test(symbols, types, timeout, mode="capability")
+
+    async def websocket_endurance_test(self, symbols: list[str], types: str = "quote",
+                                       duration_seconds: float = ITICK_WS_ENDURANCE_SECONDS) -> dict:
+        """V8-I streaming acceptance engine.
+
+        Distinguishes NO_EVENT from STALE_EVENT and FRESH_EVENT. For every
+        market-data event it records source timestamp t, gateway receipt time,
+        age, price, symbol and event type. It measures timestamp progression,
+        event frequency, gaps and per-symbol coverage. A quiet symbol is not
+        automatically failed; a received stale/repeated stream is treated
+        differently from no observed event.
+        """
+        return await self._websocket_stream_test(symbols, types, duration_seconds, mode="endurance")
+
+    async def _websocket_stream_test(self, symbols: list[str], types: str,
+                                     duration_seconds: float, mode: str) -> dict:
         if not self.configured:
-            return {"supported": False, "stage": "configuration", "error": "ITICK_API_TOKEN not configured"}
-        symbols = [normalize_symbol(x) for x in symbols if normalize_symbol(x)]
+            return {"supported": False, "promotion": "DO NOT PROMOTE", "stage": "configuration",
+                    "error": "ITICK_API_TOKEN not configured", "execution_grade": "NOT_GRANTED"}
+        symbols = list(dict.fromkeys(normalize_symbol(x) for x in symbols if normalize_symbol(x)))
         if not symbols:
-            return {"supported": False, "stage": "input", "error": "no symbols supplied"}
-        types = ",".join(sorted(set(t.strip() for t in types.split(",") if t.strip())))
-        uri = self.base_url.replace("https://", "wss://").replace("http://", "ws://") if self.base_url.startswith(("http://", "https://")) else ITICK_WS_URL
-        if "api-free.itick.org" not in uri and uri.rstrip("/") == "wss://api.itick.org/stock":
-            # Explicitly honor configured WS URL if production is intentionally supplied.
-            pass
-        else:
-            uri = ITICK_WS_URL
-        params = ",".join(f"{s}${self.region}" for s in symbols)
-        started = time.monotonic()
-        events=[]
-        auth=False
-        connected=False
-        subscribed=False
-        quote_events=[]
-        tick_events=[]
-        depth_events=[]
-        error_events=[]
+            return {"supported": False, "promotion": "DO NOT PROMOTE", "stage": "input",
+                    "error": "no symbols supplied", "execution_grade": "NOT_GRANTED"}
         try:
-            async with websockets.connect(uri, additional_headers={"token": self.token}, open_timeout=timeout, close_timeout=3) as ws:
-                connected_at=now_utc()
-                try:
-                    raw=await asyncio.wait_for(ws.recv(), timeout=min(timeout, 5))
-                    msg=json.loads(raw) if isinstance(raw,(str,bytes,bytearray)) else raw
-                    events.append(msg)
-                    if isinstance(msg,dict) and msg.get("code") == 1:
-                        connected = msg.get("msg") == "Connected Successfully"
-                        auth = msg.get("resAc") == "auth"
-                except asyncio.TimeoutError:
-                    pass
-                # The documented client flow authenticates via the token header;
-                # after connection the server may emit Connected Successfully and/or auth.
-                if not auth:
+            duration = max(1.0, min(float(duration_seconds), 1800.0))
+        except Exception:
+            duration = 120.0
+        types = ",".join(sorted(set(t.strip().lower() for t in str(types).split(",") if t.strip()))) or "quote"
+        uri = ITICK_WS_URL
+        params = ",".join(f"{sym}${self.region}" for sym in symbols)
+        started_monotonic = time.monotonic()
+        connected_at = None
+        gateway_started = now_utc()
+        events = []
+        market_events = []
+        control_events = []
+        errors = []
+        auth = False
+        connected = False
+        subscribed = False
+        subscription_ack_at = None
+        last_event_monotonic = None
+        per_symbol = {sym: {"market_events": 0, "quote_events": 0, "tick_events": 0,
+                            "depth_events": 0, "fresh_events": 0, "stale_events": 0,
+                            "invalid_timestamp_events": 0, "timestamp_progressions": 0,
+                            "duplicate_timestamp_events": 0, "source_timestamps": [],
+                            "ages_seconds": [], "event_times": [], "prices": []}
+                     for sym in symbols}
+        prev_ts = {sym: None for sym in symbols}
+        prev_receipt = {sym: None for sym in symbols}
+        max_gap = {sym: 0.0 for sym in symbols}
+        stationary_counts = {sym: 0 for sym in symbols}
+        first_market_at = None
+        last_market_at = None
+        close_reason = "duration_elapsed"
+        websocket_error = None
+
+        def classify_event(data: dict, receipt: datetime) -> dict:
+            sym = normalize_symbol(data.get("s") or data.get("symbol") or "")
+            typ = str(data.get("type") or "unknown").lower()
+            ts = parse_timestamp(data.get("t"))
+            price = finite_number(data.get("ld") or data.get("price"))
+            age = (receipt - ts).total_seconds() if ts else None
+            if ts is None:
+                freshness = "UNKNOWN"
+                reason = "source_timestamp_unavailable"
+            elif age < -FUTURE_TOLERANCE:
+                freshness = "RED"; reason = "source_timestamp_in_future"
+            elif age <= GREEN_MAX_AGE:
+                freshness = "GREEN"; reason = "timestamp_verified_fresh"
+            elif age <= AMBER_MAX_AGE:
+                freshness = "AMBER"; reason = "timestamp_verified_older"
+            elif age <= ORANGE_MAX_AGE:
+                freshness = "ORANGE"; reason = "timestamp_verified_stale"
+            else:
+                freshness = "RED"; reason = "timestamp_verified_too_old"
+            return {"symbol": sym, "type": typ, "price": price, "source_timestamp": iso(ts),
+                    "gateway_received_at": iso(receipt),
+                    "age_seconds": round(max(age, 0.0), 3) if age is not None else None,
+                    "timestamp_verified": ts is not None, "freshness": freshness, "reason": reason}
+
+        try:
+            async with websockets.connect(uri, additional_headers={"token": self.token},
+                                           open_timeout=min(15.0, max(5.0, duration)),
+                                           close_timeout=3, ping_interval=20, ping_timeout=10) as ws:
+                connected_at = now_utc()
+                # Collect initial provider messages briefly, without requiring a
+                # particular ordering of Connected/auth acknowledgements.
+                initial_deadline = time.monotonic() + min(5.0, max(2.0, duration))
+                while time.monotonic() < initial_deadline and not auth:
                     try:
-                        raw=await asyncio.wait_for(ws.recv(), timeout=min(timeout, 3))
-                        msg=json.loads(raw) if isinstance(raw,(str,bytes,bytearray)) else raw
+                        raw = await asyncio.wait_for(ws.recv(), timeout=max(0.2, initial_deadline-time.monotonic()))
+                    except asyncio.TimeoutError:
+                        break
+                    receipt = now_utc()
+                    msg = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
+                    events.append(msg)
+                    if isinstance(msg, dict) and msg.get("code") == 1 and msg.get("msg") == "Connected Successfully":
+                        connected = True
+                    if isinstance(msg, dict) and msg.get("code") == 1 and msg.get("resAc") == "auth":
+                        auth = True; connected = True
+                    if isinstance(msg, dict) and isinstance(msg.get("data"), dict) and msg["data"].get("type") in {"quote","tick","depth"}:
+                        ev = classify_event(msg["data"], receipt); market_events.append(ev); last_event_monotonic = time.monotonic()
+                    else:
+                        control_events.append({"received_at": iso(receipt), "message": msg})
+                await ws.send(json.dumps({"ac": "subscribe", "params": params, "types": types}))
+                ack_deadline = time.monotonic() + min(8.0, max(3.0, duration))
+                while time.monotonic() < ack_deadline and not subscribed:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=max(0.2, ack_deadline-time.monotonic()))
+                    except asyncio.TimeoutError:
+                        break
+                    receipt = now_utc(); msg = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
+                    events.append(msg)
+                    if isinstance(msg, dict) and msg.get("code") == 1 and msg.get("resAc") == "subscribe":
+                        subscribed = True; subscription_ack_at = receipt
+                    elif isinstance(msg, dict) and msg.get("code") == 0:
+                        errors.append({"stage": "subscription", "received_at": iso(receipt), "message": msg})
+                    if isinstance(msg, dict) and isinstance(msg.get("data"), dict) and msg["data"].get("type") in {"quote","tick","depth"}:
+                        market_events.append(classify_event(msg["data"], receipt)); last_event_monotonic = time.monotonic()
+                    else:
+                        control_events.append({"received_at": iso(receipt), "message": msg})
+                if not subscribed:
+                    close_reason = "subscription_ack_timeout"
+                else:
+                    deadline = time.monotonic() + duration
+                    while time.monotonic() < deadline and len(market_events) < ITICK_WS_MAX_EVENTS:
+                        wait = min(3.0, max(0.2, deadline-time.monotonic()))
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=wait)
+                        except asyncio.TimeoutError:
+                            # Protocol heartbeat only; never counts as market data.
+                            try:
+                                await ws.send(json.dumps({"ac": "ping", "params": str(int(time.time()*1000))}))
+                            except Exception as exc:
+                                errors.append({"stage": "heartbeat", "error": repr(exc)})
+                            continue
+                        receipt = now_utc(); msg = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
                         events.append(msg)
-                        if isinstance(msg,dict) and msg.get("resAc") == "auth" and msg.get("code") == 1:
-                            auth=True
-                        elif isinstance(msg,dict) and msg.get("code") == 0:
-                            error_events.append(msg)
-                    except asyncio.TimeoutError:
-                        pass
-                await ws.send(json.dumps({"ac":"subscribe","params":params,"types":types}))
-                raw=await asyncio.wait_for(ws.recv(), timeout=min(timeout, 5))
-                msg=json.loads(raw) if isinstance(raw,(str,bytes,bytearray)) else raw
-                events.append(msg)
-                if isinstance(msg,dict) and msg.get("code") == 1 and msg.get("resAc") == "subscribe":
-                    subscribed=True
-                elif isinstance(msg,dict) and msg.get("code") == 0:
-                    error_events.append(msg)
-                deadline=time.monotonic()+timeout
-                while time.monotonic() < deadline:
-                    try:
-                        raw=await asyncio.wait_for(ws.recv(), timeout=max(0.2, min(2.0, deadline-time.monotonic())))
-                    except asyncio.TimeoutError:
-                        await ws.send(json.dumps({"ac":"ping","params":str(int(time.time()*1000))}))
-                        continue
-                    msg=json.loads(raw) if isinstance(raw,(str,bytes,bytearray)) else raw
-                    events.append(msg)
-                    if isinstance(msg,dict) and isinstance(msg.get("data"),dict):
-                        data=msg["data"]
-                        typ=data.get("type")
-                        if typ == "quote": quote_events.append(data)
-                        elif typ == "tick": tick_events.append(data)
-                        elif typ == "depth": depth_events.append(data)
-                        if typ in {"quote","tick","depth"} and len(quote_events)+len(tick_events)+len(depth_events) >= len(symbols):
-                            # One message per requested symbol is sufficient for capability proof.
-                            if types == "quote" or quote_events:
-                                break
+                        data = msg.get("data") if isinstance(msg, dict) else None
+                        if isinstance(data, dict) and str(data.get("type") or "").lower() in {"quote","tick","depth"}:
+                            ev = classify_event(data, receipt)
+                            market_events.append(ev); last_event_monotonic = time.monotonic()
+                            if first_market_at is None: first_market_at = receipt
+                            last_market_at = receipt
+                        else:
+                            if isinstance(msg, dict) and msg.get("code") == 0:
+                                errors.append({"stage": "stream", "received_at": iso(receipt), "message": msg})
+                            control_events.append({"received_at": iso(receipt), "message": msg})
         except Exception as exc:
-            return {"supported": False, "stage":"websocket_connection_or_subscription", "error":repr(exc),
-                    "url":uri,"symbols":symbols,"types":types,
-                    "elapsed_seconds":round(time.monotonic()-started,3),"events_received":len(events),
-                    "events":events[-10:],"connected_observed":connected,"auth_observed":auth,"subscription_acknowledged":subscribed,
-                    "quote_events":quote_events[:10],"tick_events":tick_events[:10],"depth_events":depth_events[:5],
-                    "errors":error_events[-10:],
-                    "execution_grade":"NOT_GRANTED"}
-        source_now=now_utc()
-        def event_summary(items):
-            out=[]
-            for d in items[:20]:
-                ts=parse_timestamp(d.get("t"))
-                age=(source_now-ts).total_seconds() if ts else None
-                out.append({"symbol":normalize_symbol(d.get("s") or ""),"price":finite_number(d.get("ld")),
-                            "source_timestamp":iso(ts),"age_seconds":round(max(age,0),3) if age is not None else None,
-                            "timestamp_verified":ts is not None,"type":d.get("type")})
-            return out
-        return {"supported":(auth or connected) and subscribed and bool(quote_events or tick_events or depth_events),
-                "stage":"complete","url":uri,"symbols":symbols,"types":types,
-                "elapsed_seconds":round(time.monotonic()-started,3),"connected_at":iso(connected_at),
-                "gateway_observed_at":iso(source_now),"auth_observed":auth,
-                "subscription_acknowledged":subscribed,"events_received":len(events),
-                "quote_events":event_summary(quote_events),"tick_events":event_summary(tick_events),
-                "depth_events":event_summary(depth_events),"errors":error_events[-10:],
-                "policy":{"rest_quota_consumed":False,"source_timestamp_for_quote_tick":"iTick t",
-                           "depth_source_timestamp":"not provided in documented depth payload; remains UNKNOWN",
-                           "websocket_capability_is_not_execution_authorization":True},
-                "execution_grade":"NOT_GRANTED"}
+            websocket_error = repr(exc)
+            errors.append({"stage": "connection", "error": websocket_error})
+            close_reason = "connection_error"
+
+        # Analyze actual market-data events. A symbol with zero events is not
+        # marked stale: it is explicitly NO_EVENT, because a quiet stock cannot
+        # prove freshness or staleness without a received event.
+        for ev in market_events:
+            sym = ev["symbol"]
+            if sym not in per_symbol:
+                continue
+            p = per_symbol[sym]; p["market_events"] += 1; p[f'{ev["type"]}_events'] = p.get(f'{ev["type"]}_events', 0) + 1
+            if ev["age_seconds"] is None:
+                p["invalid_timestamp_events"] += 1
+            else:
+                p["ages_seconds"].append(ev["age_seconds"])
+                if ev["freshness"] == "GREEN": p["fresh_events"] += 1
+                elif ev["freshness"] in {"AMBER","ORANGE","RED"}: p["stale_events"] += 1
+            if ev["source_timestamp"]:
+                ts = parse_timestamp(ev["source_timestamp"])
+                if prev_ts[sym] is not None:
+                    delta = (ts - prev_ts[sym]).total_seconds()
+                    if delta > 0: p["timestamp_progressions"] += 1; stationary_counts[sym] = 0
+                    elif delta == 0: p["duplicate_timestamp_events"] += 1; stationary_counts[sym] += 1
+                    else: errors.append({"stage":"temporal_order","symbol":sym,"error":"source_timestamp_regressed",
+                                         "previous":iso(prev_ts[sym]),"current":iso(ts)})
+                prev_ts[sym] = ts; p["source_timestamps"].append(ev["source_timestamp"])
+            if ev["gateway_received_at"]:
+                receipt = parse_timestamp(ev["gateway_received_at"])
+                if prev_receipt[sym] is not None:
+                    max_gap[sym] = max(max_gap[sym], (receipt-prev_receipt[sym]).total_seconds())
+                prev_receipt[sym] = receipt; p["event_times"].append(ev["gateway_received_at"])
+            if ev["price"] is not None: p["prices"].append(ev["price"])
+
+        elapsed = time.monotonic() - started_monotonic
+        for sym,p in per_symbol.items():
+            ages=p["ages_seconds"]
+            p["min_age_seconds"] = round(min(ages),3) if ages else None
+            p["median_age_seconds"] = round(sorted(ages)[len(ages)//2],3) if ages else None
+            p["max_age_seconds"] = round(max(ages),3) if ages else None
+            p["max_inter_event_gap_seconds"] = round(max_gap[sym],3) if max_gap[sym] else None
+            p["temporal_progression_pass"] = p["timestamp_progressions"] > 0
+            p["status"] = "FRESH_STREAM" if p["fresh_events"] > 0 and p["timestamp_progressions"] > 0 else ("FRESH_EVENT" if p["fresh_events"] > 0 else ("STALE_STREAM" if p["stale_events"] > 0 else "NO_EVENT"))
+            p["stationary_timestamp_warning"] = stationary_counts[sym] >= ITICK_WS_MAX_STATIONARY_EVENTS
+            p["event_rate_per_minute"] = round(p["market_events"] / max(elapsed/60.0, 1/60.0), 3)
+            p.pop("source_timestamps", None); p.pop("event_times", None); p.pop("prices", None)
+
+        active_symbols = [s for s,p in per_symbol.items() if p["market_events"] > 0]
+        fresh_symbols = [s for s,p in per_symbol.items() if p["fresh_events"] > 0]
+        progressing_symbols = [s for s,p in per_symbol.items() if p["timestamp_progressions"] > 0]
+        stale_symbols = [s for s,p in per_symbol.items() if p["stale_events"] > 0]
+        invalid_symbols = [s for s,p in per_symbol.items() if p["invalid_timestamp_events"] > 0]
+        stream_quality_symbols = [s for s in symbols if per_symbol[s]["fresh_events"] > 0 and per_symbol[s]["timestamp_progressions"] > 0]
+        stream_quality_pass = bool(connected and auth and subscribed and len(active_symbols) >= ITICK_WS_MIN_ACTIVE_SYMBOLS and stream_quality_symbols and not invalid_symbols)
+        if mode == "capability":
+            promotion = "WEBSOCKET CAPABILITY PASS — STREAMING QUALITY NOT YET PROVEN" if (connected and auth and subscribed and market_events) else "DO NOT PROMOTE"
+        else:
+            promotion = "WEBSOCKET STREAMING ACCEPTANCE PASS — EXECUTION AUTHORIZATION REMAINS SEPARATE" if stream_quality_pass else "DO NOT PROMOTE"
+        return {
+            "test": "V8-I WebSocket Streaming Acceptance Engine" if mode == "endurance" else "V8-I WebSocket Capability Test",
+            "version": "3.3", "mode": mode, "status": "COMPLETE", "url": uri,
+            "symbols_requested": symbols, "types_requested": types,
+            "duration_requested_seconds": round(duration,3), "elapsed_seconds": round(elapsed,3),
+            "connected_at": iso(connected_at), "gateway_started_at": iso(gateway_started),
+            "gateway_observed_at": iso(now_utc()), "auth_observed": auth,
+            "subscription_acknowledged": subscribed, "subscription_ack_at": iso(subscription_ack_at),
+            "close_reason": close_reason, "websocket_error": websocket_error,
+            "total_protocol_messages": len(events), "market_data_events": len(market_events),
+            "quote_events": sum(1 for e in market_events if e["type"] == "quote"),
+            "tick_events": sum(1 for e in market_events if e["type"] == "tick"),
+            "depth_events": sum(1 for e in market_events if e["type"] == "depth"),
+            "active_symbols": active_symbols, "fresh_symbols": fresh_symbols,
+            "progressing_timestamp_symbols": progressing_symbols, "stale_symbols": stale_symbols,
+            "invalid_timestamp_symbols": invalid_symbols,
+            "per_symbol": per_symbol,
+            "events_sample": market_events[-50:], "errors": errors[-20:],
+            "acceptance": {
+                "connect_pass": connected,
+                "authentication_pass": auth,
+                "subscription_pass": subscribed,
+                "market_event_received": bool(market_events),
+                "fresh_event_observed": bool(fresh_symbols),
+                "timestamp_progression_observed": bool(progressing_symbols),
+                "same_symbol_fresh_and_progressing": stream_quality_symbols,
+                "no_invalid_timestamps": not bool(invalid_symbols),
+                "quiet_symbol_policy": "NO_EVENT is not treated as stale; no freshness claim is made without a received market-data event",
+                "stream_quality_pass": stream_quality_pass,
+                "minimum_active_symbols": ITICK_WS_MIN_ACTIVE_SYMBOLS,
+                "active_symbol_count": len(active_symbols),
+            },
+            "policy": {
+                "rest_quota_consumed": False,
+                "source_timestamp_for_quote_tick": "iTick t",
+                "depth_source_timestamp": "not provided in documented payload; remains UNKNOWN unless observed in event",
+                "gateway_request_latency_is_not_market_data_age": True,
+                "no_event_is_not_stale": True,
+                "execution_authorization_separate": True,
+                "api_credential_not_exposed": True,
+            },
+            "execution_grade": "NOT_GRANTED",
+            "promotion": promotion,
+        }
 
     async def get_ticks(self, symbols: list[str]) -> dict:
         return {"source": self.name, "supported": False, "reason": "ticks_not_supported"}
@@ -961,7 +1116,7 @@ async def asx_get_quotes(symbols: list[str] | None = None) -> dict:
             receipt=parse_timestamp(res.get("received_at")) or gateway_received_at
             output[symbol][name]=enrich(q,receipt,cross)
     return {
-        "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.2",
+        "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.3",
         "gateway_received_at":iso(gateway_received_at),
         "timestamp_model":{"source_timestamp":"iTick t = latest trade timestamp","source_gateway_receipt":"source HTTP response receipt timestamp","measured_age":"source_gateway_receipt - source_timestamp","request_latency_is_not_market_data_age":True},
         "symbols":syms,"sources":{name:{k:res.get(k) for k in ("available","configured","error","errors","received_at","request_latency_ms","endpoint","region","note","diagnostics")} for name,res in source_results.items()},
@@ -983,7 +1138,7 @@ async def asx_get_ticks(symbols: list[str] | None = None) -> dict:
     syms=[normalize_symbol(x) for x in (symbols or DEFAULT_SYMBOLS) if normalize_symbol(x)]
     src=ITickSource(ITICK_BASE_URL,ITICK_TOKEN,ITICK_REGION,ITICK_EXCHANGE)
     result=await src.get_ticks(syms)
-    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.2","execution_authorization":execution_authorization(),"tick_result":result}
+    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.3","execution_authorization":execution_authorization(),"tick_result":result}
 
 
 @mcp.tool()
@@ -991,18 +1146,40 @@ async def asx_get_depth(symbol: str) -> dict:
     """Fetch iTick Level-2 depth for one symbol. Depth freshness remains UNKNOWN unless the upstream response carries its own timestamp."""
     src=ITickSource(ITICK_BASE_URL,ITICK_TOKEN,ITICK_REGION,ITICK_EXCHANGE)
     result=await src.get_depth(normalize_symbol(symbol))
-    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.2","quote_and_depth_clocks_separate":True,"execution_authorization":execution_authorization(),"depth_result":result}
+    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.3","quote_and_depth_clocks_separate":True,"execution_authorization":execution_authorization(),"depth_result":result}
+
+
+@mcp.tool()
+async def asx_run_websocket_streaming_acceptance(
+    symbols: list[str] | None = None,
+    types: str = "quote",
+    duration_seconds: float | None = None,
+) -> dict:
+    """Run the V8-I WebSocket Streaming Acceptance Engine.
+
+    Default duration is configurable (120s). Use 600 seconds for the intended
+    10-minute endurance run. WebSocket traffic consumes no iTick REST calls.
+    The engine measures event freshness, timestamp progression, event gaps and
+    per-symbol coverage. NO_EVENT is distinct from STALE_EVENT.
+    """
+    syms=[normalize_symbol(x) for x in (symbols or ITICK_WS_TEST_SYMBOLS) if normalize_symbol(x)]
+    src=ITickSource(ITICK_BASE_URL,ITICK_TOKEN,ITICK_REGION,ITICK_EXCHANGE)
+    result=await src.websocket_endurance_test(syms, types=types,
+        duration_seconds=duration_seconds or ITICK_WS_ENDURANCE_SECONDS)
+    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.3",
+            "streaming_acceptance":result,
+            "execution_authorization":execution_authorization()}
 
 
 @mcp.tool()
 async def asx_run_websocket_test(symbols: list[str] | None = None, types: str = "quote", timeout_seconds: float | None = None) -> dict:
-    """Test iTick stock WebSocket capability without consuming REST calls."""
+    """Short WebSocket capability probe. For acceptance use asx_run_websocket_streaming_acceptance."""
     syms=[normalize_symbol(x) for x in (symbols or ITICK_WS_TEST_SYMBOLS) if normalize_symbol(x)]
     src=ITickSource(ITICK_BASE_URL,ITICK_TOKEN,ITICK_REGION,ITICK_EXCHANGE)
     result=await src.websocket_test(syms, types=types, timeout=timeout_seconds or ITICK_WS_TIMEOUT)
-    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.2","websocket_result":result,
+    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.3","websocket_result":result,
             "execution_authorization":execution_authorization(),
-            "important":["WebSocket testing consumes no iTick REST calls.","Quote/tick events use iTick source timestamp t when present.","A successful stream proves capability, not exchange licensing or execution authorization."]}
+            "important":["WebSocket testing consumes no iTick REST calls.","Quote/tick events use iTick source timestamp t when present.","A successful capability probe does not prove continuous streaming quality, exchange licensing or execution authorization."]}
 
 
 @mcp.tool()
@@ -1010,7 +1187,7 @@ async def asx_get_health() -> dict:
     """Return V3.2 health, timestamp model, source configuration, REST/WebSocket diagnostics and execution authorization."""
     itick_configured=bool(ITICK_TOKEN)
     return {
-        "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.2","status":"READY","timestamp_utc":iso(now_utc()),
+        "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.3","status":"READY","timestamp_utc":iso(now_utc()),
         "primary_source":{"name":"iTick","configured":itick_configured,"region":ITICK_REGION,"base_url":ITICK_BASE_URL,"role":"primary_timestamped_quote_source","source_timestamp_field":"t","source_timestamp_semantics":"latest trade timestamp","execution_grade":"NOT_GRANTED_BY_CONFIGURATION"},
         "secondary_sources":[
             {"name":"ASX Equity Stocks / Migizi Tech","enabled":ENABLE_MIGIZI,"role":"price corroboration; no verified source timestamp in this integration"},
