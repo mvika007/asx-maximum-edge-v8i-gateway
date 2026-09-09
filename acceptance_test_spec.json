@@ -1,0 +1,22 @@
+{
+  "name": "V8-I Tier-1 Five-Symbol Acceptance Test",
+  "symbols": [
+    "CBA",
+    "BHP",
+    "WGX",
+    "CBE",
+    "WLC"
+  ],
+  "snapshots": 3,
+  "minimum_pass": {
+    "all_snapshots_complete": true,
+    "all_symbols_present_each_snapshot": true,
+    "price_positive": true,
+    "volume_nonnegative_if_present": true,
+    "high_not_below_low": true,
+    "price_within_high_low_when_available": true,
+    "no_request_failures": true
+  },
+  "promotion": "TIER-1 ELIGIBLE",
+  "failure_action": "DO NOT PROMOTE"
+}
