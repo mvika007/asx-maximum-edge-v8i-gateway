@@ -1,9 +1,9 @@
-# ASX MAXIMUM EDGE™ V8-I — Data Gateway V3.3
+# ASX MAXIMUM EDGE™ V8-I — Data Gateway V3.4
 
 ## Purpose
-V3.3 is the Free-plan-compatible timestamp validation build. It removes the multi-symbol REST batch endpoint from the core validation path and uses iTick `/stock/quote` one symbol at a time. It also adds an iTick stock WebSocket capability test so streaming can be evaluated without consuming REST calls.
+V3.4 is the Free-plan-compatible timestamp validation build. It removes the multi-symbol REST batch endpoint from the core validation path and uses iTick `/stock/quote` one symbol at a time. It also adds an iTick stock WebSocket capability test so streaming can be evaluated without consuming REST calls.
 
-## V3.3 architecture
+## V3.4 architecture
 - **Primary REST:** iTick `/stock/quote` — one symbol per call; source field `t` is the latest-trade timestamp.
 - **Primary streaming test:** iTick stock WebSocket `wss://api-free.itick.org/stock`.
 - **Secondary:** Migizi for price corroboration; no verified source timestamp in this integration.
@@ -27,7 +27,7 @@ One single-symbol call per requested symbol. Run separately from the 3-call repe
 Tests connection, authentication, subscription acknowledgement, streaming events, source timestamps, and heartbeat behavior. It does **not** consume REST quota.
 
 ### `asx_test_batch_capability(symbols)`
-Optional diagnostic for `/stock/quotes`. A failure is classified as batch capability unavailable/restricted and does not fail the core V3.3 timestamp architecture.
+Optional diagnostic for `/stock/quotes`. A failure is classified as batch capability unavailable/restricted and does not fail the core V3.4 timestamp architecture.
 
 ### `asx_get_ticks`, `asx_get_depth`, `asx_get_health`
 Retained from V3.1. Depth remains a separate clock; if the upstream depth payload lacks a source timestamp, freshness is `UNKNOWN`.
@@ -57,9 +57,9 @@ The gateway tracks a process-local rolling REST budget and uses a safety margin.
 
 Never commit the real iTick token. Put it only in the deployment environment.
 
-## V3.3 WebSocket Streaming Acceptance Engine
+## V3.4 WebSocket Streaming Acceptance Engine
 
-V3.3 adds a true streaming-quality acceptance engine rather than merely extending the V3.2 timeout.
+V3.4 adds a true streaming-quality acceptance engine rather than merely extending the V3.2 timeout.
 
 ### Tool
 `asx_run_websocket_streaming_acceptance`
