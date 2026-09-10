@@ -4,6 +4,7 @@ import json
 import math
 import os
 import time
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
@@ -14,7 +15,7 @@ import httpx
 import websockets
 from mcp.server import MCPServer
 
-mcp = MCPServer("ASX MAXIMUM EDGE V8-I Data Gateway V3.4.3")
+mcp = MCPServer("ASX MAXIMUM EDGE V8-I Data Gateway V3.5")
 
 # ---------------------------------------------------------------------------
 # V3 purpose
@@ -1157,7 +1158,7 @@ async def asx_get_quotes(symbols: list[str] | None = None) -> dict:
             receipt=parse_timestamp(res.get("received_at")) or gateway_received_at
             output[symbol][name]=enrich(q,receipt,cross)
     return {
-        "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.4.3",
+        "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.5",
         "gateway_received_at":iso(gateway_received_at),
         "timestamp_model":{"source_timestamp":"iTick t = latest trade timestamp","source_gateway_receipt":"source HTTP response receipt timestamp","measured_age":"source_gateway_receipt - source_timestamp","request_latency_is_not_market_data_age":True},
         "symbols":syms,"sources":{name:{k:res.get(k) for k in ("available","configured","error","errors","received_at","request_latency_ms","endpoint","region","note","diagnostics")} for name,res in source_results.items()},
@@ -1179,7 +1180,7 @@ async def asx_get_ticks(symbols: list[str] | None = None) -> dict:
     syms=[normalize_symbol(x) for x in (symbols or DEFAULT_SYMBOLS) if normalize_symbol(x)]
     src=ITickSource(ITICK_BASE_URL,ITICK_TOKEN,ITICK_REGION,ITICK_EXCHANGE)
     result=await src.get_ticks(syms)
-    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.4.3","execution_authorization":execution_authorization(),"tick_result":result}
+    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.5","execution_authorization":execution_authorization(),"tick_result":result}
 
 
 @mcp.tool()
@@ -1187,106 +1188,214 @@ async def asx_get_depth(symbol: str) -> dict:
     """Fetch iTick Level-2 depth for one symbol. Depth freshness remains UNKNOWN unless the upstream response carries its own timestamp."""
     src=ITickSource(ITICK_BASE_URL,ITICK_TOKEN,ITICK_REGION,ITICK_EXCHANGE)
     result=await src.get_depth(normalize_symbol(symbol))
-    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.4.3","quote_and_depth_clocks_separate":True,"execution_authorization":execution_authorization(),"depth_result":result}
+    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.5","quote_and_depth_clocks_separate":True,"execution_authorization":execution_authorization(),"depth_result":result}
 
 
 @mcp.tool()
-async def asx_mcp_echo(message: str = "MCP_V3.4.3_OK") -> str:
+async def asx_mcp_echo(message: str = "MCP_V3.5_OK") -> str:
     """Minimal MCP contract diagnostic. Returns a plain text string only."""
-    return f"ASX MAXIMUM EDGE V8-I V3.4.3 ECHO: {str(message)}"
+    return f"ASX MAXIMUM EDGE V8-I V3.5 ECHO: {str(message)}"
+
+
+# ---------------------------------------------------------------------------
+# V3.5 ASYNCHRONOUS WEBSOCKET ACCEPTANCE JOB SYSTEM
+# ---------------------------------------------------------------------------
+# The synchronous endurance function is intentionally replaced by a background
+# job architecture. MCP receives an immediate response and never has to keep
+# one tool invocation open for the full 30/120/600-second stream.
+_WS_JOBS: dict[str, dict] = {}
+_WS_JOB_TASKS: dict[str, asyncio.Task] = {}
+_WS_JOB_LOCK = asyncio.Lock()
+
+
+def _new_job_id() -> str:
+    return f"ws-{uuid.uuid4().hex[:12]}"
+
+
+async def _run_ws_acceptance_job(job_id: str, request: dict) -> None:
+    started = now_utc()
+    async with _WS_JOB_LOCK:
+        if job_id in _WS_JOBS:
+            _WS_JOBS[job_id].update({
+                "status": "RUNNING",
+                "started_at_utc": iso(started),
+            })
+    try:
+        src = ITickSource(ITICK_BASE_URL, ITICK_TOKEN, ITICK_REGION, ITICK_EXCHANGE)
+        result = await src.websocket_endurance_test(
+            request["symbols"],
+            types=request["types"],
+            duration_seconds=request["duration_seconds"],
+        )
+        completed = now_utc()
+        async with _WS_JOB_LOCK:
+            _WS_JOBS[job_id].update({
+                "status": "COMPLETE",
+                "completed_at_utc": iso(completed),
+                "result": json_safe(result),
+            })
+    except asyncio.CancelledError:
+        async with _WS_JOB_LOCK:
+            if job_id in _WS_JOBS:
+                _WS_JOBS[job_id].update({
+                    "status": "CANCELLED",
+                    "completed_at_utc": iso(now_utc()),
+                    "error": "background acceptance job cancelled",
+                    "promotion": "DO NOT PROMOTE",
+                })
+        raise
+    except Exception as exc:
+        async with _WS_JOB_LOCK:
+            if job_id in _WS_JOBS:
+                _WS_JOBS[job_id].update({
+                    "status": "ERROR",
+                    "completed_at_utc": iso(now_utc()),
+                    "error": repr(exc),
+                    "failure_stage": "background_websocket_execution",
+                    "promotion": "DO NOT PROMOTE",
+                })
 
 
 @mcp.tool()
-async def asx_run_websocket_streaming_acceptance(
+async def asx_start_websocket_acceptance(
     duration_seconds: float = 30.0,
-    symbols: list[str] = None,
+    symbols: list[str] | None = None,
     types: str = "quote",
 ) -> str:
-    """Run WebSocket streaming acceptance and return ONLY plain text JSON.
+    """Start an asynchronous WebSocket acceptance job and return immediately.
 
-    V3.4.3 is a strict MCP-contract isolation build. The tool deliberately
-    returns a single string so the MCP transport does not have to infer or
-    validate a dynamically nested structured-output schema. The WebSocket
-    engine itself is unchanged.
-
-    Default duration is 30 seconds to keep the first diagnostic invocation
-    comfortably within typical hosted MCP request timeouts. Explicit calls
-    may request longer runs up to 1800 seconds.
+    V3.5 deliberately separates job creation from job execution so MCP/HTTP
+    does not need to hold a request open during an endurance stream.
     """
-    started = now_utc()
     try:
         duration = float(duration_seconds)
         if not math.isfinite(duration):
             raise ValueError("duration_seconds must be finite")
         duration = max(1.0, min(duration, 1800.0))
-
         raw_symbols = ITICK_WS_TEST_SYMBOLS if symbols is None else symbols
         syms = []
         for item in raw_symbols:
             normalized = normalize_symbol(item)
             if normalized and normalized not in syms:
                 syms.append(normalized)
-
         requested_types = ",".join(sorted(set(
             part.strip().lower() for part in str(types).split(",") if part.strip()
         ))) or "quote"
+        if not syms:
+            raise ValueError("no symbols supplied")
+        if not ITICK_TOKEN:
+            raise ValueError("ITICK_API_TOKEN not configured")
 
+        job_id = _new_job_id()
         request = {
             "duration_seconds": duration,
             "symbols": syms,
             "types": requested_types,
         }
-
-        if not syms:
-            engine_result = {
-                "status": "ERROR",
-                "stage": "input",
-                "error": "no symbols supplied",
+        created = now_utc()
+        async with _WS_JOB_LOCK:
+            _WS_JOBS[job_id] = {
+                "job_id": job_id,
+                "gateway": "ASX MAXIMUM EDGE V8-I Data Gateway V3.5",
+                "status": "QUEUED",
+                "created_at_utc": iso(created),
+                "request": request,
+                "execution_authorized": bool(execution_authorization().get("authorized", False)),
                 "promotion": "DO NOT PROMOTE",
             }
-        else:
-            src = ITickSource(
-                ITICK_BASE_URL, ITICK_TOKEN, ITICK_REGION, ITICK_EXCHANGE
-            )
-            engine_result = await src.websocket_endurance_test(
-                syms,
-                types=requested_types,
-                duration_seconds=duration,
-            )
-
-        payload = {
-            "gateway": "ASX MAXIMUM EDGE V8-I Data Gateway V3.4.3",
-            "status": "COMPLETE",
-            "mcp_contract": "PLAIN_TEXT_JSON",
+        task = asyncio.create_task(_run_ws_acceptance_job(job_id, request), name=f"v8i-ws-{job_id}")
+        _WS_JOB_TASKS[job_id] = task
+        task.add_done_callback(lambda _task, jid=job_id: _WS_JOB_TASKS.pop(jid, None))
+        return json.dumps({
+            "gateway": "ASX MAXIMUM EDGE V8-I Data Gateway V3.5",
+            "status": "STARTED",
+            "job_id": job_id,
             "request": request,
-            "engine_result": json_safe(engine_result),
-            "execution_authorized": bool(
-                execution_authorization().get("authorized", False)
-            ),
-            "started_at_utc": iso(started),
-            "completed_at_utc": iso(now_utc()),
-        }
-        return json.dumps(
-            payload,
-            ensure_ascii=False,
-            allow_nan=False,
-            separators=(",", ":"),
-        )
+            "poll_with": "asx_get_websocket_acceptance_status",
+            "retrieve_with": "asx_get_websocket_acceptance_result",
+            "created_at_utc": iso(created),
+            "execution_authorized": bool(execution_authorization().get("authorized", False)),
+        }, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     except Exception as exc:
-        payload = {
-            "gateway": "ASX MAXIMUM EDGE V8-I Data Gateway V3.4.3",
+        return json.dumps({
+            "gateway": "ASX MAXIMUM EDGE V8-I Data Gateway V3.5",
             "status": "ERROR",
-            "mcp_contract": "PLAIN_TEXT_JSON",
             "error": repr(exc),
-            "failure_stage": "tool_execution",
             "promotion": "DO NOT PROMOTE",
-            "execution_authorized": bool(
-                execution_authorization().get("authorized", False)
-            ),
-            "started_at_utc": iso(started),
-            "completed_at_utc": iso(now_utc()),
-        }
-        return json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        }, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+
+
+@mcp.tool()
+async def asx_get_websocket_acceptance_status(job_id: str) -> str:
+    """Return the current status of an asynchronous WebSocket acceptance job."""
+    jid = str(job_id).strip()
+    async with _WS_JOB_LOCK:
+        job = _WS_JOBS.get(jid)
+        if job is None:
+            return json.dumps({
+                "gateway": "ASX MAXIMUM EDGE V8-I Data Gateway V3.5",
+                "status": "NOT_FOUND",
+                "job_id": jid,
+                "promotion": "DO NOT PROMOTE",
+            }, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        return json.dumps({
+            "gateway": "ASX MAXIMUM EDGE V8-I Data Gateway V3.5",
+            "job_id": jid,
+            "status": job.get("status"),
+            "created_at_utc": job.get("created_at_utc"),
+            "started_at_utc": job.get("started_at_utc"),
+            "completed_at_utc": job.get("completed_at_utc"),
+            "request": job.get("request"),
+            "error": job.get("error"),
+            "promotion": job.get("promotion", "DO NOT PROMOTE"),
+        }, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+
+
+@mcp.tool()
+async def asx_get_websocket_acceptance_result(job_id: str) -> str:
+    """Return the completed asynchronous WebSocket acceptance result."""
+    jid = str(job_id).strip()
+    async with _WS_JOB_LOCK:
+        job = _WS_JOBS.get(jid)
+        if job is None:
+            payload = {"gateway": "ASX MAXIMUM EDGE V8-I Data Gateway V3.5", "status": "NOT_FOUND", "job_id": jid, "promotion": "DO NOT PROMOTE"}
+        elif job.get("status") == "COMPLETE":
+            payload = {
+                "gateway": "ASX MAXIMUM EDGE V8-I Data Gateway V3.5",
+                "status": "COMPLETE",
+                "job_id": jid,
+                "request": job.get("request"),
+                "started_at_utc": job.get("started_at_utc"),
+                "completed_at_utc": job.get("completed_at_utc"),
+                "engine_result": job.get("result"),
+                "execution_authorized": bool(execution_authorization().get("authorized", False)),
+            }
+        else:
+            payload = {
+                "gateway": "ASX MAXIMUM EDGE V8-I Data Gateway V3.5",
+                "status": job.get("status", "UNKNOWN"),
+                "job_id": jid,
+                "request": job.get("request"),
+                "started_at_utc": job.get("started_at_utc"),
+                "completed_at_utc": job.get("completed_at_utc"),
+                "error": job.get("error"),
+                "message": "Result is not available until status is COMPLETE.",
+                "promotion": "DO NOT PROMOTE",
+            }
+        return json.dumps(json_safe(payload), ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+
+
+@mcp.tool()
+async def asx_run_websocket_streaming_acceptance(
+    duration_seconds: float = 30.0,
+    symbols: list[str] | None = None,
+    types: str = "quote",
+) -> str:
+    """Compatibility wrapper: start an async acceptance job immediately.
+
+    V3.5 no longer blocks an MCP request for the duration of the stream.
+    """
+    return await asx_start_websocket_acceptance(duration_seconds, symbols, types)
 
 
 @mcp.tool()
@@ -1296,7 +1405,7 @@ async def asx_run_websocket_test(symbols: list[str] | None = None, types: str = 
     src=ITickSource(ITICK_BASE_URL,ITICK_TOKEN,ITICK_REGION,ITICK_EXCHANGE)
     timeout = ITICK_WS_TIMEOUT if timeout_seconds is None else max(1.0, min(float(timeout_seconds), 300.0))
     result=await src.websocket_test(syms, types=types, timeout=timeout)
-    return mcp_safe_result({"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.4.3","websocket_result":result,
+    return mcp_safe_result({"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.5","websocket_result":result,
             "execution_authorization":execution_authorization(),
             "important":["WebSocket testing consumes no iTick REST calls.","Quote/tick events use iTick source timestamp t when present.","A successful capability probe does not prove continuous streaming quality, exchange licensing or execution authorization."]})
 
@@ -1306,7 +1415,7 @@ async def asx_get_health() -> dict:
     """Return V3.4 health, timestamp model, source configuration, REST/WebSocket diagnostics and execution authorization."""
     itick_configured=bool(ITICK_TOKEN)
     return {
-        "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.4.3","status":"READY","timestamp_utc":iso(now_utc()),
+        "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.5","status":"READY","timestamp_utc":iso(now_utc()),
         "primary_source":{"name":"iTick","configured":itick_configured,"region":ITICK_REGION,"base_url":ITICK_BASE_URL,"role":"primary_timestamped_quote_source","source_timestamp_field":"t","source_timestamp_semantics":"latest trade timestamp","execution_grade":"NOT_GRANTED_BY_CONFIGURATION"},
         "secondary_sources":[
             {"name":"ASX Equity Stocks / Migizi Tech","enabled":ENABLE_MIGIZI,"role":"price corroboration; no verified source timestamp in this integration"},

@@ -1,32 +1,22 @@
-# ASX MAXIMUM EDGE™ V8-I Data Gateway V3.4.3
+# ASX MAXIMUM EDGE™ V8-I Data Gateway V3.5
 
-**MCP Contract Isolation Edition**
+## Asynchronous WebSocket Acceptance Edition
 
-V3.4.3 is a diagnostic release focused specifically on the MCP response contract for the WebSocket streaming acceptance engine.
+V3.5 replaces the blocking WebSocket endurance invocation with a background-job architecture. MCP requests return immediately; the WebSocket stream runs in the gateway process and is inspected through status/result tools.
 
-## Core change
-`asx_run_websocket_streaming_acceptance` returns one plain text string containing strict JSON. The WebSocket measurement engine is unchanged.
+### Workflow
+1. `asx_start_websocket_acceptance(duration_seconds, symbols, types)` → returns a `job_id` immediately.
+2. `asx_get_websocket_acceptance_status(job_id)` → poll until `COMPLETE`, `ERROR`, or `CANCELLED`.
+3. `asx_get_websocket_acceptance_result(job_id)` → retrieve the completed result.
 
-## First deployment checks
-1. Deploy this directory to the MCP host.
-2. Call `asx_get_health` and confirm the gateway reports `V3.4.3`.
-3. Call `asx_mcp_echo` and confirm `MCP_V3.4.3_OK`.
-4. Call `asx_run_websocket_streaming_acceptance` with no parameters.
+`asx_run_websocket_streaming_acceptance` remains as a compatibility wrapper and now starts the asynchronous job rather than blocking.
 
-The default diagnostic run is 30 seconds.
+### Diagnostic tool
+`asx_mcp_echo` remains available and returns plain text.
 
-## Explicit test
-After the default test succeeds:
-
-```json
-{
-  "duration_seconds": 30,
-  "symbols": ["BHP"],
-  "types": "quote"
-}
-```
-
-For endurance validation, request the required duration explicitly (for example 600 seconds) only after the 30-second MCP contract test succeeds.
-
-## Safety
-A fresh timestamped quote or successful stream does not grant execution authorization and does not establish profitability, exchange licensing, or complete order-book coverage.
+### Important
+- Jobs are process-local in this build. A restart/redeploy clears in-memory jobs.
+- WebSocket testing consumes no iTick REST calls.
+- A successful stream does not grant execution authorization.
+- Run acceptance during an active ASX market session for meaningful event-coverage testing.
+- `NO_EVENT` is distinct from `STALE_EVENT`.
