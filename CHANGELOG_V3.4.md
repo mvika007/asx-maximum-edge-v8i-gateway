@@ -1,7 +1,7 @@
-# V3.4 — MCP Transport Hardening
+# V3.4.1 — MCP Transport Hardening
 
 ## Purpose
-V3.4 is a corrective deployment build based on V3.3. It preserves the V3.3 data-integrity architecture while hardening the WebSocket streaming acceptance tool against MCP `-32603 Invalid response format` failures and argument/default substitution issues.
+V3.4.1 is a corrective deployment build based on V3.3. It preserves the V3.3 data-integrity architecture while hardening the WebSocket streaming acceptance tool against MCP `-32603 Invalid response format` failures and argument/default substitution issues.
 
 ## Changes
 - Reordered `asx_run_websocket_streaming_acceptance` parameters to the documented order: `duration_seconds`, `symbols`, `types`.
@@ -17,7 +17,7 @@ V3.4 is a corrective deployment build based on V3.3. It preserves the V3.3 data-
 - No real iTick token is included.
 
 ## Important
-V3.4 does not grant execution authorization. A successful WebSocket acceptance result remains a data-integrity result only. `NO_EVENT` remains distinct from stale data, and gateway latency is never used as market-data age.
+V3.4.1 does not grant execution authorization. A successful WebSocket acceptance result remains a data-integrity result only. `NO_EVENT` remains distinct from stale data, and gateway latency is never used as market-data age.
 
 ## Recommended first test
 Use the MCP tool with exact named arguments:

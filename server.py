@@ -1192,84 +1192,82 @@ async def asx_get_depth(symbol: str) -> dict:
 
 @mcp.tool()
 async def asx_run_websocket_streaming_acceptance(
-    duration_seconds: float | None = None,
-    symbols: list[str] | None = None,
+    duration_seconds: float = 120.0,
+    symbols: list[str] = None,
     types: str = "quote",
-) -> dict:
+) -> str:
     """Run the V8-I WebSocket Streaming Acceptance Engine.
 
-    V3.4 hardens the MCP boundary: arguments are normalized explicitly and the
-    returned object is recursively converted to strict JSON primitives. This
-    prevents client-side MCP -32603 Invalid response format errors caused by
-    non-JSON nested values.
+    V3.4 MCP-compatibility mode: the tool returns a JSON document as plain text
+    rather than relying on SDK structured-output inference. This avoids clients
+    that reject dynamically-shaped dict results with MCP -32603 Invalid response format.
 
-    The tool accepts named arguments; the documented defaults are BHP,CBA,WGX,
-    quote events and 120 seconds. Use 600 seconds for endurance acceptance.
+    Defaults: BHP,CBA,WGX; quote events; 120 seconds.
     WebSocket traffic consumes no iTick REST calls.
     """
-    # Explicit None handling avoids Python's truthiness shortcut and preserves a
-    # caller-supplied numeric duration exactly (including values such as 1.0).
-    if duration_seconds is None:
-        duration = ITICK_WS_ENDURANCE_SECONDS
-    else:
+    try:
         try:
             duration = float(duration_seconds)
         except (TypeError, ValueError):
-            duration = ITICK_WS_ENDURANCE_SECONDS
-    duration = max(1.0, min(duration, 1800.0))
+            duration = 120.0
+        if not math.isfinite(duration):
+            duration = 120.0
+        duration = max(1.0, min(duration, 1800.0))
 
-    raw_symbols = symbols if symbols is not None else ITICK_WS_TEST_SYMBOLS
-    syms = []
-    for item in raw_symbols:
-        normalized = normalize_symbol(item)
-        if normalized and normalized not in syms:
-            syms.append(normalized)
-    if not syms:
-        return mcp_safe_result({
-            "gateway": "ASX MAXIMUM EDGE V8-I Data Gateway V3.4",
-            "status": "ERROR",
-            "error": "no symbols supplied",
-            "execution_authorization": execution_authorization(),
-        })
+        raw_symbols = ITICK_WS_TEST_SYMBOLS if symbols is None else symbols
+        syms = []
+        for item in raw_symbols:
+            normalized = normalize_symbol(item)
+            if normalized and normalized not in syms:
+                syms.append(normalized)
 
-    requested_types = ",".join(sorted(set(
-        part.strip().lower() for part in str(types).split(",") if part.strip()
-    ))) or "quote"
+        requested_types = ",".join(sorted(set(
+            part.strip().lower() for part in str(types).split(",") if part.strip()
+        ))) or "quote"
 
-    src = ITickSource(ITICK_BASE_URL, ITICK_TOKEN, ITICK_REGION, ITICK_EXCHANGE)
-    try:
+        request_echo = {
+            "duration_seconds": duration,
+            "symbols": syms,
+            "types": requested_types,
+        }
+
+        if not syms:
+            payload = {
+                "gateway": "ASX MAXIMUM EDGE V8-I Data Gateway V3.4",
+                "tool": "asx_run_websocket_streaming_acceptance",
+                "status": "ERROR",
+                "request": request_echo,
+                "error": "no symbols supplied",
+                "promotion": "DO NOT PROMOTE",
+                "execution_authorization": execution_authorization(),
+            }
+            return json.dumps(json_safe(payload), ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+
+        src = ITickSource(ITICK_BASE_URL, ITICK_TOKEN, ITICK_REGION, ITICK_EXCHANGE)
         result = await src.websocket_endurance_test(
             syms, types=requested_types, duration_seconds=duration
         )
-        output = {
+        payload = {
             "gateway": "ASX MAXIMUM EDGE V8-I Data Gateway V3.4",
             "tool": "asx_run_websocket_streaming_acceptance",
             "status": "COMPLETE",
-            "request": {
-                "duration_seconds": duration,
-                "symbols": syms,
-                "types": requested_types,
-            },
+            "request": request_echo,
             "streaming_acceptance": result,
             "execution_authorization": execution_authorization(),
         }
-        return mcp_safe_result(output)
+        safe = json_safe(payload)
+        return json.dumps(safe, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     except Exception as exc:
-        # Never leak a Python exception object through MCP structured output.
-        return mcp_safe_result({
+        payload = {
             "gateway": "ASX MAXIMUM EDGE V8-I Data Gateway V3.4",
             "tool": "asx_run_websocket_streaming_acceptance",
             "status": "ERROR",
-            "request": {
-                "duration_seconds": duration,
-                "symbols": syms,
-                "types": requested_types,
-            },
             "error": repr(exc),
             "failure_stage": "tool_execution",
-            "execution_authorization": execution_authorization(),
             "promotion": "DO NOT PROMOTE",
-        })
+            "execution_authorization": execution_authorization(),
+        }
+        return json.dumps(json_safe(payload), ensure_ascii=False, allow_nan=False, separators=(",", ":"))
 
 
 @mcp.tool()
