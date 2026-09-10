@@ -1,6 +1,6 @@
 {
   "version": "3.4",
-  "title": "ASX MAXIMUM EDGE V8-I Data Gateway V3.4.2.2 Acceptance Specification",
+  "title": "ASX MAXIMUM EDGE V8-I Data Gateway V3.4.3.2 Acceptance Specification",
   "design_goal": "Prove timestamped single-symbol REST integrity and measure real WebSocket streaming quality without consuming Free-plan REST quota.",
   "tier_1_rest": {
     "name": "Single-symbol timestamp repeatability",

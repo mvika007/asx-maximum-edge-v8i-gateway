@@ -14,7 +14,7 @@ import httpx
 import websockets
 from mcp.server import MCPServer
 
-mcp = MCPServer("ASX MAXIMUM EDGE V8-I Data Gateway V3.4.2")
+mcp = MCPServer("ASX MAXIMUM EDGE V8-I Data Gateway V3.4.3")
 
 # ---------------------------------------------------------------------------
 # V3 purpose
@@ -1157,7 +1157,7 @@ async def asx_get_quotes(symbols: list[str] | None = None) -> dict:
             receipt=parse_timestamp(res.get("received_at")) or gateway_received_at
             output[symbol][name]=enrich(q,receipt,cross)
     return {
-        "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.4.2",
+        "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.4.3",
         "gateway_received_at":iso(gateway_received_at),
         "timestamp_model":{"source_timestamp":"iTick t = latest trade timestamp","source_gateway_receipt":"source HTTP response receipt timestamp","measured_age":"source_gateway_receipt - source_timestamp","request_latency_is_not_market_data_age":True},
         "symbols":syms,"sources":{name:{k:res.get(k) for k in ("available","configured","error","errors","received_at","request_latency_ms","endpoint","region","note","diagnostics")} for name,res in source_results.items()},
@@ -1179,7 +1179,7 @@ async def asx_get_ticks(symbols: list[str] | None = None) -> dict:
     syms=[normalize_symbol(x) for x in (symbols or DEFAULT_SYMBOLS) if normalize_symbol(x)]
     src=ITickSource(ITICK_BASE_URL,ITICK_TOKEN,ITICK_REGION,ITICK_EXCHANGE)
     result=await src.get_ticks(syms)
-    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.4.2","execution_authorization":execution_authorization(),"tick_result":result}
+    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.4.3","execution_authorization":execution_authorization(),"tick_result":result}
 
 
 @mcp.tool()
@@ -1187,26 +1187,31 @@ async def asx_get_depth(symbol: str) -> dict:
     """Fetch iTick Level-2 depth for one symbol. Depth freshness remains UNKNOWN unless the upstream response carries its own timestamp."""
     src=ITickSource(ITICK_BASE_URL,ITICK_TOKEN,ITICK_REGION,ITICK_EXCHANGE)
     result=await src.get_depth(normalize_symbol(symbol))
-    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.4.2","quote_and_depth_clocks_separate":True,"execution_authorization":execution_authorization(),"depth_result":result}
+    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.4.3","quote_and_depth_clocks_separate":True,"execution_authorization":execution_authorization(),"depth_result":result}
 
 
 @mcp.tool()
-async def asx_mcp_echo(message: str = "MCP_V3.4.2_OK") -> str:
+async def asx_mcp_echo(message: str = "MCP_V3.4.3_OK") -> str:
     """Minimal MCP contract diagnostic. Returns a plain text string only."""
-    return f"ASX MAXIMUM EDGE V8-I V3.4.2 ECHO: {str(message)}"
+    return f"ASX MAXIMUM EDGE V8-I V3.4.3 ECHO: {str(message)}"
 
 
 @mcp.tool()
 async def asx_run_websocket_streaming_acceptance(
-    duration_seconds: float = 120.0,
+    duration_seconds: float = 30.0,
     symbols: list[str] = None,
     types: str = "quote",
-) -> dict:
-    """Run WebSocket acceptance using a fixed-shape MCP response.
+) -> str:
+    """Run WebSocket streaming acceptance and return ONLY plain text JSON.
 
-    V3.4.2 avoids both dynamic structured output and giant top-level text output.
-    The complete engine result is JSON-encoded inside the fixed `result_json`
-    string field. This isolates MCP schema validation from the WebSocket payload.
+    V3.4.3 is a strict MCP-contract isolation build. The tool deliberately
+    returns a single string so the MCP transport does not have to infer or
+    validate a dynamically nested structured-output schema. The WebSocket
+    engine itself is unchanged.
+
+    Default duration is 30 seconds to keep the first diagnostic invocation
+    comfortably within typical hosted MCP request timeouts. Explicit calls
+    may request longer runs up to 1800 seconds.
     """
     started = now_utc()
     try:
@@ -1214,40 +1219,74 @@ async def asx_run_websocket_streaming_acceptance(
         if not math.isfinite(duration):
             raise ValueError("duration_seconds must be finite")
         duration = max(1.0, min(duration, 1800.0))
+
         raw_symbols = ITICK_WS_TEST_SYMBOLS if symbols is None else symbols
-        syms=[]
+        syms = []
         for item in raw_symbols:
-            normalized=normalize_symbol(item)
+            normalized = normalize_symbol(item)
             if normalized and normalized not in syms:
                 syms.append(normalized)
-        requested_types=",".join(sorted(set(part.strip().lower() for part in str(types).split(",") if part.strip()))) or "quote"
-        request={"duration_seconds":duration,"symbols":syms,"types":requested_types}
+
+        requested_types = ",".join(sorted(set(
+            part.strip().lower() for part in str(types).split(",") if part.strip()
+        ))) or "quote"
+
+        request = {
+            "duration_seconds": duration,
+            "symbols": syms,
+            "types": requested_types,
+        }
+
         if not syms:
-            result={"status":"ERROR","error":"no symbols supplied"}
+            engine_result = {
+                "status": "ERROR",
+                "stage": "input",
+                "error": "no symbols supplied",
+                "promotion": "DO NOT PROMOTE",
+            }
         else:
-            src=ITickSource(ITICK_BASE_URL,ITICK_TOKEN,ITICK_REGION,ITICK_EXCHANGE)
-            result=await src.websocket_endurance_test(syms,types=requested_types,duration_seconds=duration)
-        safe=json_safe(result)
-        result_json=json.dumps(safe,ensure_ascii=False,allow_nan=False,separators=(",",":"))
-        return {
-            "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.4.2",
-            "status":"COMPLETE" if result.get("status") not in {"ERROR","FAIL"} else str(result.get("status")),
-            "request_json":json.dumps(request,separators=(",",":")),
-            "result_json":result_json,
-            "execution_authorized":bool(execution_authorization().get("authorized",False)),
-            "started_at_utc":iso(started),
-            "completed_at_utc":iso(now_utc()),
+            src = ITickSource(
+                ITICK_BASE_URL, ITICK_TOKEN, ITICK_REGION, ITICK_EXCHANGE
+            )
+            engine_result = await src.websocket_endurance_test(
+                syms,
+                types=requested_types,
+                duration_seconds=duration,
+            )
+
+        payload = {
+            "gateway": "ASX MAXIMUM EDGE V8-I Data Gateway V3.4.3",
+            "status": "COMPLETE",
+            "mcp_contract": "PLAIN_TEXT_JSON",
+            "request": request,
+            "engine_result": json_safe(engine_result),
+            "execution_authorized": bool(
+                execution_authorization().get("authorized", False)
+            ),
+            "started_at_utc": iso(started),
+            "completed_at_utc": iso(now_utc()),
         }
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
     except Exception as exc:
-        return {
-            "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.4.2",
-            "status":"ERROR",
-            "request_json":"{}",
-            "result_json":json.dumps({"error":repr(exc),"failure_stage":"tool_execution","promotion":"DO NOT PROMOTE"},separators=(",",":")),
-            "execution_authorized":bool(execution_authorization().get("authorized",False)),
-            "started_at_utc":iso(started),
-            "completed_at_utc":iso(now_utc()),
+        payload = {
+            "gateway": "ASX MAXIMUM EDGE V8-I Data Gateway V3.4.3",
+            "status": "ERROR",
+            "mcp_contract": "PLAIN_TEXT_JSON",
+            "error": repr(exc),
+            "failure_stage": "tool_execution",
+            "promotion": "DO NOT PROMOTE",
+            "execution_authorized": bool(
+                execution_authorization().get("authorized", False)
+            ),
+            "started_at_utc": iso(started),
+            "completed_at_utc": iso(now_utc()),
         }
+        return json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
 
 
 @mcp.tool()
@@ -1257,7 +1296,7 @@ async def asx_run_websocket_test(symbols: list[str] | None = None, types: str = 
     src=ITickSource(ITICK_BASE_URL,ITICK_TOKEN,ITICK_REGION,ITICK_EXCHANGE)
     timeout = ITICK_WS_TIMEOUT if timeout_seconds is None else max(1.0, min(float(timeout_seconds), 300.0))
     result=await src.websocket_test(syms, types=types, timeout=timeout)
-    return mcp_safe_result({"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.4.2","websocket_result":result,
+    return mcp_safe_result({"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.4.3","websocket_result":result,
             "execution_authorization":execution_authorization(),
             "important":["WebSocket testing consumes no iTick REST calls.","Quote/tick events use iTick source timestamp t when present.","A successful capability probe does not prove continuous streaming quality, exchange licensing or execution authorization."]})
 
@@ -1267,7 +1306,7 @@ async def asx_get_health() -> dict:
     """Return V3.4 health, timestamp model, source configuration, REST/WebSocket diagnostics and execution authorization."""
     itick_configured=bool(ITICK_TOKEN)
     return {
-        "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.4.2","status":"READY","timestamp_utc":iso(now_utc()),
+        "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.4.3","status":"READY","timestamp_utc":iso(now_utc()),
         "primary_source":{"name":"iTick","configured":itick_configured,"region":ITICK_REGION,"base_url":ITICK_BASE_URL,"role":"primary_timestamped_quote_source","source_timestamp_field":"t","source_timestamp_semantics":"latest trade timestamp","execution_grade":"NOT_GRANTED_BY_CONFIGURATION"},
         "secondary_sources":[
             {"name":"ASX Equity Stocks / Migizi Tech","enabled":ENABLE_MIGIZI,"role":"price corroboration; no verified source timestamp in this integration"},

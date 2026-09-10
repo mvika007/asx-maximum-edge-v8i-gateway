@@ -1,37 +1,32 @@
-# ASX MAXIMUM EDGE™ V8-I Data Gateway V3.4.2
-## MCP Contract Isolation Edition
+# ASX MAXIMUM EDGE™ V8-I Data Gateway V3.4.3
 
-V3.4.2 preserves the V3.3/V3.4 data architecture while isolating MCP response-format failures from WebSocket logic.
+**MCP Contract Isolation Edition**
 
-### Primary data architecture
-- iTick AU is the primary timestamped quote source.
-- iTick WebSocket quote/tick events use source timestamp `t` when present.
-- Migizi remains secondary price corroboration without verified source timestamps.
-- Execution authorization remains separate and defaults to NOT_GRANTED.
+V3.4.3 is a diagnostic release focused specifically on the MCP response contract for the WebSocket streaming acceptance engine.
 
-### MCP diagnostic tools
-- `asx_get_health` — server/source health.
-- `asx_mcp_echo` — minimal plain-string MCP contract test.
-- `asx_run_websocket_streaming_acceptance` — WebSocket acceptance with fixed-shape MCP output.
-- Existing quote, tick, depth, capability, breadth and batch diagnostics retained.
+## Core change
+`asx_run_websocket_streaming_acceptance` returns one plain text string containing strict JSON. The WebSocket measurement engine is unchanged.
 
-### Acceptance response
-The acceptance tool returns a fixed-shape object with:
-- gateway
-- status
-- request_json
-- result_json
-- execution_authorized
-- started_at_utc
-- completed_at_utc
+## First deployment checks
+1. Deploy this directory to the MCP host.
+2. Call `asx_get_health` and confirm the gateway reports `V3.4.3`.
+3. Call `asx_mcp_echo` and confirm `MCP_V3.4.3_OK`.
+4. Call `asx_run_websocket_streaming_acceptance` with no parameters.
 
-`result_json` contains the complete JSON-serialized WebSocket acceptance result.
+The default diagnostic run is 30 seconds.
 
-### Recommended first test
-Run `asx_mcp_echo` with default parameters. Expected response:
-`ASX MAXIMUM EDGE V8-I V3.4.2 ECHO: MCP_V3.4.2_OK`
+## Explicit test
+After the default test succeeds:
 
-Then run the WebSocket acceptance tool with no parameters.
+```json
+{
+  "duration_seconds": 30,
+  "symbols": ["BHP"],
+  "types": "quote"
+}
+```
 
-### Production policy
-A fresh timestamp does not itself establish exchange licensing, depth completeness, execution authorization or profitability. Do not promote to execution grade without the complete V8-I evidence gates.
+For endurance validation, request the required duration explicitly (for example 600 seconds) only after the 30-second MCP contract test succeeds.
+
+## Safety
+A fresh timestamped quote or successful stream does not grant execution authorization and does not establish profitability, exchange licensing, or complete order-book coverage.
