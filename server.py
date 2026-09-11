@@ -12,10 +12,13 @@ from collections import deque
 from pathlib import Path
 
 V36_STATE_DIR = Path(os.getenv("ASX_V8I_JOB_STATE_DIR", "/tmp/asx_v8i_ws_jobs"))
-V36_JOB_HEARTBEAT_SECONDS = max(5.0, float(os.getenv("ASX_V8I_JOB_HEARTBEAT_SECONDS", "10")))
-V36_ORPHAN_AFTER_SECONDS = max(30.0, float(os.getenv("ASX_V8I_JOB_ORPHAN_AFTER_SECONDS", "45")))
+V36_JOB_HEARTBEAT_SECONDS = max(5.0, float(os.getenv("ASX_V8I_JOB_HEARTBEAT_SECONDS", "5")))
+V36_ORPHAN_AFTER_SECONDS = max(30.0, float(os.getenv("ASX_V8I_JOB_ORPHAN_AFTER_SECONDS", "60")))
 V36_WS_CONNECT_ATTEMPTS = max(1, int(os.getenv("ASX_V8I_WS_CONNECT_ATTEMPTS", "2")))
 V36_WS_RETRY_BACKOFF_SECONDS = max(0.5, float(os.getenv("ASX_V8I_WS_RETRY_BACKOFF_SECONDS", "2")))
+V361_WS_SUBSCRIPTION_ATTEMPTS = max(1, int(os.getenv("ASX_V8I_WS_SUBSCRIPTION_ATTEMPTS", "2")))
+V361_WS_SUBSCRIPTION_ACK_TIMEOUT = max(2.0, float(os.getenv("ASX_V8I_WS_SUBSCRIPTION_ACK_TIMEOUT", "10")))
+V361_WS_SUBSCRIPTION_RETRY_BACKOFF_SECONDS = max(0.25, float(os.getenv("ASX_V8I_WS_SUBSCRIPTION_RETRY_BACKOFF_SECONDS", "1")))
 
 def _v36_atomic_write_json(path: Path, payload: dict):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -39,7 +42,7 @@ import httpx
 import websockets
 from mcp.server import MCPServer
 
-mcp = MCPServer("ASX MAXIMUM EDGE V8-I Data Gateway V3.6")
+mcp = MCPServer("ASX MAXIMUM EDGE V8-I Data Gateway V3.6.1")
 
 # ---------------------------------------------------------------------------
 # V3 purpose
@@ -392,10 +395,10 @@ class MarketDataSource(ABC):
         stages=[]; errors=[]; control=[]; market=[]
         syms=list(dict.fromkeys(normalize_symbol(x) for x in symbols if normalize_symbol(x)))
         if not self.configured:
-            return {"test":"V3.6 WebSocket Connection Diagnostic","status":"NOT_RUN","stage":"configuration",
+            return {"test":"V3.6.1 WebSocket Connection Diagnostic","status":"NOT_RUN","stage":"configuration",
                     "error":"ITICK_API_TOKEN not configured","execution_grade":"NOT_GRANTED"}
         if not syms:
-            return {"test":"V3.6 WebSocket Connection Diagnostic","status":"NOT_RUN","stage":"input",
+            return {"test":"V3.6.1 WebSocket Connection Diagnostic","status":"NOT_RUN","stage":"input",
                     "error":"no symbols supplied","execution_grade":"NOT_GRANTED"}
         types=",".join(sorted(set(t.strip().lower() for t in str(types).split(",") if t.strip()))) or "quote"
         params=",".join(f"{sym}${self.region}" for sym in syms)
@@ -474,8 +477,8 @@ class MarketDataSource(ABC):
             mark("websocket_handshake","FAIL",error=repr(exc))
             errors.append({"stage":"connection","error":repr(exc),"exception_type":type(exc).__name__})
         elapsed=time.monotonic()-started
-        return {"test":"V3.6 WebSocket Connection Diagnostic","status":"PASS" if market and not errors else "FAILED",
-                "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6","started_at_utc":iso(started_wall),
+        return {"test":"V3.6.1 WebSocket Connection Diagnostic","status":"PASS" if market and not errors else "FAILED",
+                "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6.1","started_at_utc":iso(started_wall),
                 "completed_at_utc":iso(now_utc()),"elapsed_seconds":round(elapsed,3),"url":uri,
                 "symbols":syms,"types":types,"stages":stages,"market_events":market,
                 "control_message_count":len(control),"errors":errors,
@@ -607,23 +610,40 @@ class MarketDataSource(ABC):
                         ev = classify_event(msg["data"], receipt); market_events.append(ev); last_event_monotonic = time.monotonic()
                     else:
                         control_events.append({"received_at": iso(receipt), "message": msg})
-                await ws.send(json.dumps({"ac": "subscribe", "params": params, "types": types}))
-                ack_deadline = time.monotonic() + min(8.0, max(3.0, duration))
-                while time.monotonic() < ack_deadline and not subscribed:
+                subscription_attempts = []
+                for sub_attempt in range(1, V361_WS_SUBSCRIPTION_ATTEMPTS + 1):
+                    sub_started = time.monotonic()
+                    ack_deadline = time.monotonic() + min(V361_WS_SUBSCRIPTION_ACK_TIMEOUT, max(2.0, duration))
+                    ack_received = False
+                    sub_error = None
                     try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=max(0.2, ack_deadline-time.monotonic()))
-                    except asyncio.TimeoutError:
+                        await ws.send(json.dumps({"ac": "subscribe", "params": params, "types": types}))
+                        while time.monotonic() < ack_deadline and not subscribed:
+                            try:
+                                raw = await asyncio.wait_for(ws.recv(), timeout=max(0.2, ack_deadline-time.monotonic()))
+                            except asyncio.TimeoutError:
+                                break
+                            receipt = now_utc(); msg = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
+                            events.append(msg)
+                            if isinstance(msg, dict) and msg.get("code") == 1 and msg.get("resAc") == "subscribe":
+                                subscribed = True; subscription_ack_at = receipt; ack_received = True
+                            elif isinstance(msg, dict) and msg.get("code") == 0:
+                                sub_error = msg
+                                errors.append({"stage": "subscription", "attempt": sub_attempt, "received_at": iso(receipt), "message": msg})
+                            if isinstance(msg, dict) and isinstance(msg.get("data"), dict) and msg["data"].get("type") in {"quote","tick","depth"}:
+                                ev = classify_event(msg["data"], receipt); market_events.append(ev); last_event_monotonic = time.monotonic()
+                                if first_market_at is None: first_market_at = receipt
+                                last_market_at = receipt
+                            else:
+                                control_events.append({"received_at": iso(receipt), "message": msg})
+                    except Exception as exc:
+                        sub_error = repr(exc)
+                        errors.append({"stage": "subscription_send", "attempt": sub_attempt, "error": sub_error})
+                    subscription_attempts.append({"attempt": sub_attempt, "status": "PASS" if ack_received else "FAIL", "ack_received": ack_received, "elapsed_ms": round((time.monotonic()-sub_started)*1000,1), "error": sub_error})
+                    if subscribed:
                         break
-                    receipt = now_utc(); msg = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
-                    events.append(msg)
-                    if isinstance(msg, dict) and msg.get("code") == 1 and msg.get("resAc") == "subscribe":
-                        subscribed = True; subscription_ack_at = receipt
-                    elif isinstance(msg, dict) and msg.get("code") == 0:
-                        errors.append({"stage": "subscription", "received_at": iso(receipt), "message": msg})
-                    if isinstance(msg, dict) and isinstance(msg.get("data"), dict) and msg["data"].get("type") in {"quote","tick","depth"}:
-                        market_events.append(classify_event(msg["data"], receipt)); last_event_monotonic = time.monotonic()
-                    else:
-                        control_events.append({"received_at": iso(receipt), "message": msg})
+                    if sub_attempt < V361_WS_SUBSCRIPTION_ATTEMPTS:
+                        await asyncio.sleep(V361_WS_SUBSCRIPTION_RETRY_BACKOFF_SECONDS * sub_attempt)
                 if not subscribed:
                     close_reason = "subscription_ack_timeout"
                 else:
@@ -722,6 +742,9 @@ class MarketDataSource(ABC):
             "duration_requested_seconds": round(duration,3), "elapsed_seconds": round(elapsed,3),
             "connected_at": iso(connected_at), "gateway_started_at": iso(gateway_started),
             "connection_attempts": connection_attempts,
+            "subscription_attempts": locals().get("subscription_attempts", []),
+            "subscription_policy": {"max_attempts": V361_WS_SUBSCRIPTION_ATTEMPTS, "ack_timeout_seconds": V361_WS_SUBSCRIPTION_ACK_TIMEOUT, "retry_backoff_seconds": V361_WS_SUBSCRIPTION_RETRY_BACKOFF_SECONDS},
+            "subscription_request": {"params": params, "types": types},
             "collection_started_at": iso(subscription_ack_at) if subscription_ack_at else None,
             "collection_observed_at": iso(now_utc()),
             "gateway_observed_at": iso(now_utc()), "auth_observed": auth,
@@ -1265,7 +1288,7 @@ async def asx_get_quotes(symbols: list[str] | None = None) -> dict:
             receipt=parse_timestamp(res.get("received_at")) or gateway_received_at
             output[symbol][name]=enrich(q,receipt,cross)
     return {
-        "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6",
+        "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6.1",
         "gateway_received_at":iso(gateway_received_at),
         "timestamp_model":{"source_timestamp":"iTick t = latest trade timestamp","source_gateway_receipt":"source HTTP response receipt timestamp","measured_age":"source_gateway_receipt - source_timestamp","request_latency_is_not_market_data_age":True},
         "symbols":syms,"sources":{name:{k:res.get(k) for k in ("available","configured","error","errors","received_at","request_latency_ms","endpoint","region","note","diagnostics")} for name,res in source_results.items()},
@@ -1287,7 +1310,7 @@ async def asx_get_ticks(symbols: list[str] | None = None) -> dict:
     syms=[normalize_symbol(x) for x in (symbols or DEFAULT_SYMBOLS) if normalize_symbol(x)]
     src=ITickSource(ITICK_BASE_URL,ITICK_TOKEN,ITICK_REGION,ITICK_EXCHANGE)
     result=await src.get_ticks(syms)
-    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6","execution_authorization":execution_authorization(),"tick_result":result}
+    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6.1","execution_authorization":execution_authorization(),"tick_result":result}
 
 
 @mcp.tool()
@@ -1295,7 +1318,7 @@ async def asx_get_depth(symbol: str) -> dict:
     """Fetch iTick Level-2 depth for one symbol. Depth freshness remains UNKNOWN unless the upstream response carries its own timestamp."""
     src=ITickSource(ITICK_BASE_URL,ITICK_TOKEN,ITICK_REGION,ITICK_EXCHANGE)
     result=await src.get_depth(normalize_symbol(symbol))
-    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6","quote_and_depth_clocks_separate":True,"execution_authorization":execution_authorization(),"depth_result":result}
+    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6.1","quote_and_depth_clocks_separate":True,"execution_authorization":execution_authorization(),"depth_result":result}
 
 
 _WS_JOBS = {}
@@ -1348,47 +1371,47 @@ async def _run_ws_acceptance_job(job_id, request):
 
 @mcp.tool()
 async def asx_start_websocket_acceptance(duration_seconds: float=30.0, symbols: list[str] | None=None, types: str="quote") -> str:
-    """Start a V3.6 WebSocket acceptance job with persistent job records and heartbeat telemetry."""
+    """Start a V3.6.1 WebSocket acceptance job with persistent job records and heartbeat telemetry."""
     syms=[normalize_symbol(x) for x in (symbols or ITICK_WS_TEST_SYMBOLS) if normalize_symbol(x)]
     try: duration=max(1.0,min(float(duration_seconds),1800.0))
     except Exception: duration=30.0
     job_id=_new_job_id(); created=iso(now_utc())
     request={"duration_seconds":duration,"symbols":syms,"types":types,"gateway_version":"3.6"}
-    job={"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6","job_id":job_id,"status":"STARTED","created_at":created,"started_at":None,"heartbeat_at":None,"completed_at":None,"request":request,"result":None,"execution_authorization":execution_authorization()}
+    job={"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6.1","job_id":job_id,"status":"STARTED","created_at":created,"started_at":None,"heartbeat_at":None,"completed_at":None,"request":request,"result":None,"execution_authorization":execution_authorization()}
     async with _WS_JOB_LOCK:
         _WS_JOBS[job_id]=job
         await _v36_persist(job)
         _WS_JOB_TASKS[job_id]=asyncio.create_task(_run_ws_acceptance_job(job_id,request))
-    return json.dumps({"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6","status":"STARTED","job_id":job_id,"created_at":created,"request":request,"persistence":"filesystem-backed job manifest","execution_authorization":execution_authorization()})
+    return json.dumps({"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6.1","status":"STARTED","job_id":job_id,"created_at":created,"request":request,"persistence":"filesystem-backed job manifest","execution_authorization":execution_authorization()})
 
 @mcp.tool()
 async def asx_get_websocket_acceptance_status(job_id: str) -> str:
     j=_v36_read_job(job_id) or _WS_JOBS.get(job_id)
     if not j:
-        return json.dumps({"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6","job_id":job_id,"status":"NOT_FOUND"})
+        return json.dumps({"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6.1","job_id":job_id,"status":"NOT_FOUND"})
     status=j.get("status")
     if status=="RUNNING" and j.get("heartbeat_at"):
         hb=parse_timestamp(j["heartbeat_at"])
         if hb and (now_utc()-hb).total_seconds()>V36_ORPHAN_AFTER_SECONDS:
             status="ORPHANED"
-    return json.dumps({"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6","job_id":job_id,"status":status,"created_at":j.get("created_at"),"started_at":j.get("started_at"),"heartbeat_at":j.get("heartbeat_at"),"completed_at":j.get("completed_at"),"request":j.get("request"),"persistence":"filesystem-backed job manifest"})
+    return json.dumps({"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6.1","job_id":job_id,"status":status,"created_at":j.get("created_at"),"started_at":j.get("started_at"),"heartbeat_at":j.get("heartbeat_at"),"completed_at":j.get("completed_at"),"request":j.get("request"),"persistence":"filesystem-backed job manifest"})
 
 @mcp.tool()
 async def asx_get_websocket_acceptance_result(job_id: str) -> str:
     j=_v36_read_job(job_id) or _WS_JOBS.get(job_id)
     if not j:
-        return json.dumps({"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6","job_id":job_id,"status":"NOT_FOUND"})
+        return json.dumps({"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6.1","job_id":job_id,"status":"NOT_FOUND"})
     if j.get("status")=="RUNNING" and j.get("heartbeat_at"):
         hb=parse_timestamp(j["heartbeat_at"])
         if hb and (now_utc()-hb).total_seconds()>V36_ORPHAN_AFTER_SECONDS:
-            return json.dumps({"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6","job_id":job_id,"status":"ORPHANED","message":"Persistent manifest exists but heartbeat is stale; no result is claimed."})
-    return json.dumps(j.get("result") or {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6","job_id":job_id,"status":j.get("status"),"error":j.get("error"),"message":"Result not yet available"})
+            return json.dumps({"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6.1","job_id":job_id,"status":"ORPHANED","message":"Persistent manifest exists but heartbeat is stale; no result is claimed."})
+    return json.dumps(j.get("result") or {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6.1","job_id":job_id,"status":j.get("status"),"error":j.get("error"),"message":"Result not yet available"})
 
 @mcp.tool()
 async def asx_websocket_job_manifest(job_id: str) -> str:
     """Inspect persistent acceptance-job manifest without claiming market-data success."""
     j=_v36_read_job(job_id)
-    return json.dumps(j or {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6","job_id":job_id,"status":"NOT_FOUND"})
+    return json.dumps(j or {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6.1","job_id":job_id,"status":"NOT_FOUND"})
 
 @mcp.tool()
 async def asx_run_websocket_streaming_acceptance(
@@ -1407,7 +1430,7 @@ async def asx_run_websocket_streaming_acceptance(
     src=ITickSource(ITICK_BASE_URL,ITICK_TOKEN,ITICK_REGION,ITICK_EXCHANGE)
     result=await src.websocket_endurance_test(syms, types=types,
         duration_seconds=duration_seconds or ITICK_WS_ENDURANCE_SECONDS)
-    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6",
+    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6.1",
             "streaming_acceptance":result,
             "execution_authorization":execution_authorization()}
 
@@ -1418,7 +1441,7 @@ async def asx_run_websocket_test(symbols: list[str] | None = None, types: str = 
     syms=[normalize_symbol(x) for x in (symbols or ITICK_WS_TEST_SYMBOLS) if normalize_symbol(x)]
     src=ITickSource(ITICK_BASE_URL,ITICK_TOKEN,ITICK_REGION,ITICK_EXCHANGE)
     result=await src.websocket_test(syms, types=types, timeout=timeout_seconds or ITICK_WS_TIMEOUT)
-    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6","websocket_result":result,
+    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6.1","websocket_result":result,
             "execution_authorization":execution_authorization(),
             "important":["WebSocket testing consumes no iTick REST calls.","Quote/tick events use iTick source timestamp t when present.","A successful capability probe does not prove continuous streaming quality, exchange licensing or execution authorization."]}
 
@@ -1428,7 +1451,7 @@ async def asx_get_health() -> dict:
     """Return V3.2 health, timestamp model, source configuration, REST/WebSocket diagnostics and execution authorization."""
     itick_configured=bool(ITICK_TOKEN)
     return {
-        "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6","status":"READY","timestamp_utc":iso(now_utc()),
+        "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6.1","status":"READY","timestamp_utc":iso(now_utc()),
         "primary_source":{"name":"iTick","configured":itick_configured,"region":ITICK_REGION,"base_url":ITICK_BASE_URL,"role":"primary_timestamped_quote_source","source_timestamp_field":"t","source_timestamp_semantics":"latest trade timestamp","execution_grade":"NOT_GRANTED_BY_CONFIGURATION"},
         "secondary_sources":[
             {"name":"ASX Equity Stocks / Migizi Tech","enabled":ENABLE_MIGIZI,"role":"price corroboration; no verified source timestamp in this integration"},

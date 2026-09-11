@@ -1,8 +1,8 @@
-# ASX MAXIMUM EDGE™ V8-I — Data Gateway V3.6
+# ASX MAXIMUM EDGE™ V8-I — Data Gateway V3.6.1
 
-V3.6 is the WebSocket acceptance reliability build. It preserves the V3.x timestamped iTick architecture and V3.5.1 diagnostic path while fixing the main acceptance-job observability weaknesses identified in testing.
+V3.6.1 is the WebSocket acceptance reliability build. It preserves the V3.x timestamped iTick architecture and V3.5.1 diagnostic path while fixing the main acceptance-job observability weaknesses identified in testing.
 
-## V3.6 changes
+## V3.6.1 changes
 - Persistent filesystem-backed acceptance-job manifests (configurable with `ASX_V8I_JOB_STATE_DIR`).
 - Job lifecycle: STARTED → RUNNING → COMPLETE / FAILED / CANCELLED; stale RUNNING manifests are reported as ORPHANED rather than silently becoming NOT_FOUND.
 - Heartbeat telemetry for long-running jobs.
@@ -44,3 +44,12 @@ The job manifest is persisted before execution begins. A process restart can pre
 - streamable HTTP MCP server
 
 Never commit the real iTick token. Configure it only through the deployment environment.
+
+
+## V3.6.1 reliability changes
+- Subscription ACK retry with explicit per-attempt telemetry.
+- Configurable subscription ACK timeout and retry backoff.
+- Exact subscription request (`params` and `types`) recorded in results.
+- Connection, authentication, subscription and market-event failures remain separate.
+- Faster persistent job heartbeat and longer orphan grace period.
+- Failed or incomplete streams never grant execution authorization.
