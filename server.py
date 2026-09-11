@@ -9,12 +9,37 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from typing import Any, Optional
 from collections import deque
+from pathlib import Path
+
+V36_STATE_DIR = Path(os.getenv("ASX_V8I_JOB_STATE_DIR", "/tmp/asx_v8i_ws_jobs"))
+V36_JOB_HEARTBEAT_SECONDS = max(5.0, float(os.getenv("ASX_V8I_JOB_HEARTBEAT_SECONDS", "10")))
+V36_ORPHAN_AFTER_SECONDS = max(30.0, float(os.getenv("ASX_V8I_JOB_ORPHAN_AFTER_SECONDS", "45")))
+V36_WS_CONNECT_ATTEMPTS = max(1, int(os.getenv("ASX_V8I_WS_CONNECT_ATTEMPTS", "2")))
+V36_WS_RETRY_BACKOFF_SECONDS = max(0.5, float(os.getenv("ASX_V8I_WS_RETRY_BACKOFF_SECONDS", "2")))
+
+def _v36_atomic_write_json(path: Path, payload: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=True, separators=(",", ":"), default=str), encoding="utf-8")
+    tmp.replace(path)
+
+def _v36_job_path(job_id: str) -> Path:
+    return V36_STATE_DIR / f"{job_id}.json"
+
+def _v36_read_job(job_id: str):
+    path = _v36_job_path(job_id)
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        return {"job_id": job_id, "status": "CORRUPT", "error": repr(exc)}
 
 import httpx
 import websockets
 from mcp.server import MCPServer
 
-mcp = MCPServer("ASX MAXIMUM EDGE V8-I Data Gateway V3.5.1")
+mcp = MCPServer("ASX MAXIMUM EDGE V8-I Data Gateway V3.6")
 
 # ---------------------------------------------------------------------------
 # V3 purpose
@@ -367,10 +392,10 @@ class MarketDataSource(ABC):
         stages=[]; errors=[]; control=[]; market=[]
         syms=list(dict.fromkeys(normalize_symbol(x) for x in symbols if normalize_symbol(x)))
         if not self.configured:
-            return {"test":"V3.5.1 WebSocket Connection Diagnostic","status":"NOT_RUN","stage":"configuration",
+            return {"test":"V3.6 WebSocket Connection Diagnostic","status":"NOT_RUN","stage":"configuration",
                     "error":"ITICK_API_TOKEN not configured","execution_grade":"NOT_GRANTED"}
         if not syms:
-            return {"test":"V3.5.1 WebSocket Connection Diagnostic","status":"NOT_RUN","stage":"input",
+            return {"test":"V3.6 WebSocket Connection Diagnostic","status":"NOT_RUN","stage":"input",
                     "error":"no symbols supplied","execution_grade":"NOT_GRANTED"}
         types=",".join(sorted(set(t.strip().lower() for t in str(types).split(",") if t.strip()))) or "quote"
         params=",".join(f"{sym}${self.region}" for sym in syms)
@@ -449,8 +474,8 @@ class MarketDataSource(ABC):
             mark("websocket_handshake","FAIL",error=repr(exc))
             errors.append({"stage":"connection","error":repr(exc),"exception_type":type(exc).__name__})
         elapsed=time.monotonic()-started
-        return {"test":"V3.5.1 WebSocket Connection Diagnostic","status":"PASS" if market and not errors else "FAILED",
-                "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.5.1","started_at_utc":iso(started_wall),
+        return {"test":"V3.6 WebSocket Connection Diagnostic","status":"PASS" if market and not errors else "FAILED",
+                "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6","started_at_utc":iso(started_wall),
                 "completed_at_utc":iso(now_utc()),"elapsed_seconds":round(elapsed,3),"url":uri,
                 "symbols":syms,"types":types,"stages":stages,"market_events":market,
                 "control_message_count":len(control),"errors":errors,
@@ -541,10 +566,27 @@ class MarketDataSource(ABC):
                     "age_seconds": round(max(age, 0.0), 3) if age is not None else None,
                     "timestamp_verified": ts is not None, "freshness": freshness, "reason": reason}
 
+        connection_attempts=[]
         try:
-            async with websockets.connect(uri, additional_headers={"token": self.token},
-                                           open_timeout=min(15.0, max(5.0, duration)),
-                                           close_timeout=3, ping_interval=20, ping_timeout=10) as ws:
+            last_exc=None
+            ws_cm=None
+            for attempt in range(1, V36_WS_CONNECT_ATTEMPTS+1):
+                attempt_started=time.monotonic()
+                try:
+                    ws_cm=websockets.connect(uri, additional_headers={"token": self.token},
+                                             open_timeout=min(15.0, max(5.0, duration)),
+                                             close_timeout=3, ping_interval=20, ping_timeout=10)
+                    ws = await ws_cm.__aenter__()
+                    connection_attempts.append({"attempt":attempt,"status":"PASS","elapsed_ms":round((time.monotonic()-attempt_started)*1000,1)})
+                    break
+                except Exception as exc:
+                    last_exc=exc
+                    connection_attempts.append({"attempt":attempt,"status":"FAIL","elapsed_ms":round((time.monotonic()-attempt_started)*1000,1),"error":repr(exc),"exception_type":type(exc).__name__})
+                    if attempt < V36_WS_CONNECT_ATTEMPTS:
+                        await asyncio.sleep(V36_WS_RETRY_BACKOFF_SECONDS * attempt)
+            if ws_cm is None or 'ws' not in locals():
+                raise last_exc or TimeoutError("WebSocket connection failed")
+            try:
                 connected_at = now_utc()
                 # Collect initial provider messages briefly, without requiring a
                 # particular ordering of Connected/auth acknowledgements.
@@ -609,6 +651,11 @@ class MarketDataSource(ABC):
                             if isinstance(msg, dict) and msg.get("code") == 0:
                                 errors.append({"stage": "stream", "received_at": iso(receipt), "message": msg})
                             control_events.append({"received_at": iso(receipt), "message": msg})
+            finally:
+                try:
+                    await ws_cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
         except Exception as exc:
             websocket_error = repr(exc)
             errors.append({"stage": "connection", "error": websocket_error})
@@ -674,6 +721,9 @@ class MarketDataSource(ABC):
             "symbols_requested": symbols, "types_requested": types,
             "duration_requested_seconds": round(duration,3), "elapsed_seconds": round(elapsed,3),
             "connected_at": iso(connected_at), "gateway_started_at": iso(gateway_started),
+            "connection_attempts": connection_attempts,
+            "collection_started_at": iso(subscription_ack_at) if subscription_ack_at else None,
+            "collection_observed_at": iso(now_utc()),
             "gateway_observed_at": iso(now_utc()), "auth_observed": auth,
             "subscription_acknowledged": subscribed, "subscription_ack_at": iso(subscription_ack_at),
             "close_reason": close_reason, "websocket_error": websocket_error,
@@ -708,6 +758,9 @@ class MarketDataSource(ABC):
                 "no_event_is_not_stale": True,
                 "execution_authorization_separate": True,
                 "api_credential_not_exposed": True,
+                "connection_retry_attempts": V36_WS_CONNECT_ATTEMPTS,
+                "retry_backoff_seconds": V36_WS_RETRY_BACKOFF_SECONDS,
+                "persistent_job_manifest": True,
             },
             "execution_grade": "NOT_GRANTED",
             "promotion": promotion,
@@ -1212,7 +1265,7 @@ async def asx_get_quotes(symbols: list[str] | None = None) -> dict:
             receipt=parse_timestamp(res.get("received_at")) or gateway_received_at
             output[symbol][name]=enrich(q,receipt,cross)
     return {
-        "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.5.1",
+        "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6",
         "gateway_received_at":iso(gateway_received_at),
         "timestamp_model":{"source_timestamp":"iTick t = latest trade timestamp","source_gateway_receipt":"source HTTP response receipt timestamp","measured_age":"source_gateway_receipt - source_timestamp","request_latency_is_not_market_data_age":True},
         "symbols":syms,"sources":{name:{k:res.get(k) for k in ("available","configured","error","errors","received_at","request_latency_ms","endpoint","region","note","diagnostics")} for name,res in source_results.items()},
@@ -1234,7 +1287,7 @@ async def asx_get_ticks(symbols: list[str] | None = None) -> dict:
     syms=[normalize_symbol(x) for x in (symbols or DEFAULT_SYMBOLS) if normalize_symbol(x)]
     src=ITickSource(ITICK_BASE_URL,ITICK_TOKEN,ITICK_REGION,ITICK_EXCHANGE)
     result=await src.get_ticks(syms)
-    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.5.1","execution_authorization":execution_authorization(),"tick_result":result}
+    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6","execution_authorization":execution_authorization(),"tick_result":result}
 
 
 @mcp.tool()
@@ -1242,7 +1295,7 @@ async def asx_get_depth(symbol: str) -> dict:
     """Fetch iTick Level-2 depth for one symbol. Depth freshness remains UNKNOWN unless the upstream response carries its own timestamp."""
     src=ITickSource(ITICK_BASE_URL,ITICK_TOKEN,ITICK_REGION,ITICK_EXCHANGE)
     result=await src.get_depth(normalize_symbol(symbol))
-    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.5.1","quote_and_depth_clocks_separate":True,"execution_authorization":execution_authorization(),"depth_result":result}
+    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6","quote_and_depth_clocks_separate":True,"execution_authorization":execution_authorization(),"depth_result":result}
 
 
 _WS_JOBS = {}
@@ -1252,47 +1305,90 @@ _WS_JOB_LOCK = asyncio.Lock()
 def _new_job_id():
     return "ws-" + hashlib.sha1(f"{time.time_ns()}".encode()).hexdigest()[:12]
 
+async def _v36_persist(job):
+    await asyncio.to_thread(_v36_atomic_write_json, _v36_job_path(job["job_id"]), job)
+
+async def _v36_heartbeat(job):
+    job["heartbeat_at"] = iso(now_utc())
+    await _v36_persist(job)
+
 async def _run_ws_acceptance_job(job_id, request):
+    job = _v36_read_job(job_id) or _WS_JOBS.get(job_id)
+    if not job:
+        return
+    job["status"] = "RUNNING"; job["started_at"] = iso(now_utc()); job["heartbeat_at"] = job["started_at"]
+    await _v36_persist(job)
+    async def heartbeat_loop():
+        while True:
+            await asyncio.sleep(V36_JOB_HEARTBEAT_SECONDS)
+            job["heartbeat_at"] = iso(now_utc())
+            await _v36_persist(job)
+    hb_task = asyncio.create_task(heartbeat_loop())
     try:
-        _WS_JOBS[job_id]["status"]="RUNNING"
         src=ITickSource(ITICK_BASE_URL,ITICK_TOKEN,ITICK_REGION,ITICK_EXCHANGE)
         result=await src.websocket_endurance_test(request["symbols"],types=request["types"],duration_seconds=request["duration_seconds"])
-        _WS_JOBS[job_id]["result"]={"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.5.1","job_id":job_id,"status":"COMPLETE","request":request,"result":result,"execution_authorization":execution_authorization()}
-        _WS_JOBS[job_id]["status"]="COMPLETE"
+        job["status"]="COMPLETE"
+        job["completed_at"]=iso(now_utc())
+        job["heartbeat_at"]=job["completed_at"]
+        job["result"]=result
+        job["execution_authorization"]=execution_authorization()
+        await _v36_persist(job)
+    except asyncio.CancelledError:
+        job["status"]="CANCELLED"; job["completed_at"]=iso(now_utc()); job["heartbeat_at"]=job["completed_at"]; job["error"]="job task cancelled"
+        await _v36_persist(job)
+        raise
     except Exception as exc:
-        _WS_JOBS[job_id]["status"]="FAILED"
-        _WS_JOBS[job_id]["result"]={"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.5.1","job_id":job_id,"status":"FAILED","request":request,"error":repr(exc),"execution_authorization":execution_authorization()}
+        job["status"]="FAILED"; job["completed_at"]=iso(now_utc()); job["heartbeat_at"]=job["completed_at"]; job["error"]=repr(exc); job["exception_type"]=type(exc).__name__
+        job["execution_authorization"]=execution_authorization()
+        await _v36_persist(job)
     finally:
-        _WS_JOBS[job_id]["completed_at"]=iso(now_utc())
+        hb_task.cancel()
+        try: await hb_task
+        except asyncio.CancelledError: pass
 
 @mcp.tool()
 async def asx_start_websocket_acceptance(duration_seconds: float=30.0, symbols: list[str] | None=None, types: str="quote") -> str:
-    """Start background WebSocket acceptance job without blocking the MCP request."""
+    """Start a V3.6 WebSocket acceptance job with persistent job records and heartbeat telemetry."""
     syms=[normalize_symbol(x) for x in (symbols or ITICK_WS_TEST_SYMBOLS) if normalize_symbol(x)]
-    job_id=_new_job_id(); request={"duration_seconds":float(duration_seconds),"symbols":syms,"types":types}
+    try: duration=max(1.0,min(float(duration_seconds),1800.0))
+    except Exception: duration=30.0
+    job_id=_new_job_id(); created=iso(now_utc())
+    request={"duration_seconds":duration,"symbols":syms,"types":types,"gateway_version":"3.6"}
+    job={"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6","job_id":job_id,"status":"STARTED","created_at":created,"started_at":None,"heartbeat_at":None,"completed_at":None,"request":request,"result":None,"execution_authorization":execution_authorization()}
     async with _WS_JOB_LOCK:
-        _WS_JOBS[job_id]={"status":"STARTED","job_id":job_id,"created_at":iso(now_utc()),"request":request,"result":None}
+        _WS_JOBS[job_id]=job
+        await _v36_persist(job)
         _WS_JOB_TASKS[job_id]=asyncio.create_task(_run_ws_acceptance_job(job_id,request))
-    return json.dumps({"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.5.1","status":"STARTED","job_id":job_id,"created_at":_WS_JOBS[job_id]["created_at"],"request":request,"execution_authorization":execution_authorization()})
+    return json.dumps({"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6","status":"STARTED","job_id":job_id,"created_at":created,"request":request,"persistence":"filesystem-backed job manifest","execution_authorization":execution_authorization()})
 
 @mcp.tool()
 async def asx_get_websocket_acceptance_status(job_id: str) -> str:
-    j=_WS_JOBS.get(job_id)
-    return json.dumps({"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.5.1","job_id":job_id,"status":j.get("status") if j else "NOT_FOUND","created_at":j.get("created_at") if j else None,"completed_at":j.get("completed_at") if j else None})
+    j=_v36_read_job(job_id) or _WS_JOBS.get(job_id)
+    if not j:
+        return json.dumps({"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6","job_id":job_id,"status":"NOT_FOUND"})
+    status=j.get("status")
+    if status=="RUNNING" and j.get("heartbeat_at"):
+        hb=parse_timestamp(j["heartbeat_at"])
+        if hb and (now_utc()-hb).total_seconds()>V36_ORPHAN_AFTER_SECONDS:
+            status="ORPHANED"
+    return json.dumps({"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6","job_id":job_id,"status":status,"created_at":j.get("created_at"),"started_at":j.get("started_at"),"heartbeat_at":j.get("heartbeat_at"),"completed_at":j.get("completed_at"),"request":j.get("request"),"persistence":"filesystem-backed job manifest"})
 
 @mcp.tool()
 async def asx_get_websocket_acceptance_result(job_id: str) -> str:
-    j=_WS_JOBS.get(job_id)
-    if not j: return json.dumps({"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.5.1","job_id":job_id,"status":"NOT_FOUND"})
-    return json.dumps(j.get("result") or {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.5.1","job_id":job_id,"status":j.get("status"),"message":"Result not yet available"})
+    j=_v36_read_job(job_id) or _WS_JOBS.get(job_id)
+    if not j:
+        return json.dumps({"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6","job_id":job_id,"status":"NOT_FOUND"})
+    if j.get("status")=="RUNNING" and j.get("heartbeat_at"):
+        hb=parse_timestamp(j["heartbeat_at"])
+        if hb and (now_utc()-hb).total_seconds()>V36_ORPHAN_AFTER_SECONDS:
+            return json.dumps({"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6","job_id":job_id,"status":"ORPHANED","message":"Persistent manifest exists but heartbeat is stale; no result is claimed."})
+    return json.dumps(j.get("result") or {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6","job_id":job_id,"status":j.get("status"),"error":j.get("error"),"message":"Result not yet available"})
 
 @mcp.tool()
-async def asx_websocket_connection_diagnostic(symbols: list[str] | None=None, types: str="quote", timeout_seconds: float=15.0) -> str:
-    """Stage-by-stage iTick WebSocket handshake/auth/subscription/first-event diagnostic."""
-    syms=[normalize_symbol(x) for x in (symbols or ["BHP"]) if normalize_symbol(x)]
-    src=ITickSource(ITICK_BASE_URL,ITICK_TOKEN,ITICK_REGION,ITICK_EXCHANGE)
-    result=await src.websocket_connection_diagnostic(syms,types=types,timeout=timeout_seconds)
-    return json.dumps(result)
+async def asx_websocket_job_manifest(job_id: str) -> str:
+    """Inspect persistent acceptance-job manifest without claiming market-data success."""
+    j=_v36_read_job(job_id)
+    return json.dumps(j or {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6","job_id":job_id,"status":"NOT_FOUND"})
 
 @mcp.tool()
 async def asx_run_websocket_streaming_acceptance(
@@ -1311,7 +1407,7 @@ async def asx_run_websocket_streaming_acceptance(
     src=ITickSource(ITICK_BASE_URL,ITICK_TOKEN,ITICK_REGION,ITICK_EXCHANGE)
     result=await src.websocket_endurance_test(syms, types=types,
         duration_seconds=duration_seconds or ITICK_WS_ENDURANCE_SECONDS)
-    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.5.1",
+    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6",
             "streaming_acceptance":result,
             "execution_authorization":execution_authorization()}
 
@@ -1322,7 +1418,7 @@ async def asx_run_websocket_test(symbols: list[str] | None = None, types: str = 
     syms=[normalize_symbol(x) for x in (symbols or ITICK_WS_TEST_SYMBOLS) if normalize_symbol(x)]
     src=ITickSource(ITICK_BASE_URL,ITICK_TOKEN,ITICK_REGION,ITICK_EXCHANGE)
     result=await src.websocket_test(syms, types=types, timeout=timeout_seconds or ITICK_WS_TIMEOUT)
-    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.5.1","websocket_result":result,
+    return {"gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6","websocket_result":result,
             "execution_authorization":execution_authorization(),
             "important":["WebSocket testing consumes no iTick REST calls.","Quote/tick events use iTick source timestamp t when present.","A successful capability probe does not prove continuous streaming quality, exchange licensing or execution authorization."]}
 
@@ -1332,7 +1428,7 @@ async def asx_get_health() -> dict:
     """Return V3.2 health, timestamp model, source configuration, REST/WebSocket diagnostics and execution authorization."""
     itick_configured=bool(ITICK_TOKEN)
     return {
-        "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.5.1","status":"READY","timestamp_utc":iso(now_utc()),
+        "gateway":"ASX MAXIMUM EDGE V8-I Data Gateway V3.6","status":"READY","timestamp_utc":iso(now_utc()),
         "primary_source":{"name":"iTick","configured":itick_configured,"region":ITICK_REGION,"base_url":ITICK_BASE_URL,"role":"primary_timestamped_quote_source","source_timestamp_field":"t","source_timestamp_semantics":"latest trade timestamp","execution_grade":"NOT_GRANTED_BY_CONFIGURATION"},
         "secondary_sources":[
             {"name":"ASX Equity Stocks / Migizi Tech","enabled":ENABLE_MIGIZI,"role":"price corroboration; no verified source timestamp in this integration"},
@@ -1343,6 +1439,7 @@ async def asx_get_health() -> dict:
         "rest_rate_limit_assumption":f"{ITICK_FREE_REST_LIMIT_PER_MINUTE} calls/minute (configure to match plan)",
         "rate_limit_diagnostics":await itick_budget_status(),
         "execution_authorization":execution_authorization(),
+        "websocket_acceptance_jobs":{"persistent_manifests":True,"state_dir":"/tmp/asx_v8i_ws_jobs (configurable)","orphan_detection_seconds":V36_ORPHAN_AFTER_SECONDS},
         "critical_policy":"A GREEN quote proves timestamp freshness only. It does not prove exchange licensing, order-book completeness, execution authorization, or trading profitability.",
     }
 
